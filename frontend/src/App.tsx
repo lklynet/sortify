@@ -282,7 +282,6 @@ function App() {
                 <div className="settings-group-header">
                   <h4>Navidrome</h4>
                 </div>
-                <p className="status">Password is persisted in encrypted form and never sent back to the UI after save.</p>
                 <div className="controls-grid">
                   <div className="field">
                     <label htmlFor="navidromeUrl">Navidrome URL</label>
@@ -328,7 +327,6 @@ function App() {
                 <div className="settings-group-header">
                   <h4>API Keys</h4>
                 </div>
-                <p className="status">API keys are persisted in encrypted form and stay masked here after save.</p>
                 <div className="controls-grid">
                   <div className="field">
                     <label htmlFor="lastFmApiKey">Last.fm API Key</label>
