@@ -33,8 +33,11 @@ type Settings = {
   navidromeUrl: string;
   navidromeUsername: string;
   navidromePassword: string;
+  hasNavidromePassword: boolean;
   lastFmApiKey: string;
+  hasLastFmApiKey: boolean;
   geminiApiKey: string;
+  hasGeminiApiKey: boolean;
   geminiModel: string;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
@@ -60,8 +63,11 @@ function App() {
     navidromeUrl: "",
     navidromeUsername: "",
     navidromePassword: "",
+    hasNavidromePassword: false,
     lastFmApiKey: "",
+    hasLastFmApiKey: false,
     geminiApiKey: "",
+    hasGeminiApiKey: false,
     geminiModel: "models/gemini-flash-lite-latest",
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
@@ -70,8 +76,11 @@ function App() {
     navidromeUrl: "",
     navidromeUsername: "",
     navidromePassword: "",
+    hasNavidromePassword: false,
     lastFmApiKey: "",
+    hasLastFmApiKey: false,
     geminiApiKey: "",
+    hasGeminiApiKey: false,
     geminiModel: "models/gemini-flash-lite-latest",
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
@@ -86,26 +95,60 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [toastEntry, setToastEntry] = useState<OperationLog | null>(null);
 
+  const hasNavidromePassword = Boolean(settingsDraft.navidromePassword.trim() || settingsDraft.hasNavidromePassword);
   const hasSubsonicConnection = Boolean(
-    settingsDraft.navidromeUrl.trim() && settingsDraft.navidromeUsername.trim() && settingsDraft.navidromePassword.trim()
+    settingsDraft.navidromeUrl.trim() && settingsDraft.navidromeUsername.trim() && hasNavidromePassword
   );
-  const hasGemini = Boolean(settingsDraft.geminiApiKey.trim());
+  const hasGemini = Boolean(settingsDraft.geminiApiKey.trim() || settingsDraft.hasGeminiApiKey);
   const startReady = hasSubsonicConnection && hasGemini;
   const keyStatus = useMemo(
     () => ({
-      lastfm: settingsDraft.lastFmApiKey.trim().length > 0,
-      gemini: settingsDraft.geminiApiKey.trim().length > 0
+      lastfm: Boolean(settingsDraft.lastFmApiKey.trim() || settingsDraft.hasLastFmApiKey),
+      gemini: Boolean(settingsDraft.geminiApiKey.trim() || settingsDraft.hasGeminiApiKey)
     }),
-    [settingsDraft.geminiApiKey, settingsDraft.lastFmApiKey]
+    [settingsDraft.geminiApiKey, settingsDraft.hasGeminiApiKey, settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
   );
-  const connectionPayload = useMemo(
-    () => ({
+  const mergeSettingsDraft = useCallback(
+    (nextSettings: Settings, currentDraft: Settings) => ({
+      ...nextSettings,
+      navidromePassword: currentDraft.navidromePassword,
+      lastFmApiKey: currentDraft.lastFmApiKey,
+      geminiApiKey: currentDraft.geminiApiKey,
+      hasNavidromePassword: nextSettings.hasNavidromePassword || currentDraft.navidromePassword.trim().length > 0,
+      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0,
+      hasGeminiApiKey: nextSettings.hasGeminiApiKey || currentDraft.geminiApiKey.trim().length > 0
+    }),
+    []
+  );
+  const settingsPayload = useMemo(() => {
+    const nextSettings: Record<string, string | number> = {
+      navidromeUrl: settingsDraft.navidromeUrl.trim(),
+      navidromeUsername: settingsDraft.navidromeUsername.trim(),
+      geminiModel: settingsDraft.geminiModel.trim().replace(/^models\//, ""),
+      weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount,
+      maxTracksPerPlaylist: settingsDraft.maxTracksPerPlaylist
+    };
+    if (settingsDraft.navidromePassword.trim()) {
+      nextSettings.navidromePassword = settingsDraft.navidromePassword.trim();
+    }
+    if (settingsDraft.lastFmApiKey.trim()) {
+      nextSettings.lastFmApiKey = settingsDraft.lastFmApiKey.trim();
+    }
+    if (settingsDraft.geminiApiKey.trim()) {
+      nextSettings.geminiApiKey = settingsDraft.geminiApiKey.trim();
+    }
+    return nextSettings;
+  }, [settingsDraft]);
+  const connectionPayload = useMemo(() => {
+    const payload: Record<string, string> = {
       baseUrl: settingsDraft.navidromeUrl.trim(),
-      username: settingsDraft.navidromeUsername.trim(),
-      password: settingsDraft.navidromePassword.trim()
-    }),
-    [settingsDraft.navidromePassword, settingsDraft.navidromeUrl, settingsDraft.navidromeUsername]
-  );
+      username: settingsDraft.navidromeUsername.trim()
+    };
+    if (settingsDraft.navidromePassword.trim()) {
+      payload.password = settingsDraft.navidromePassword.trim();
+    }
+    return payload;
+  }, [settingsDraft.navidromePassword, settingsDraft.navidromeUrl, settingsDraft.navidromeUsername]);
 
   const loadDashboardData = useCallback(async () => {
     const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedWorker, fetchedSettings] = await Promise.all([
@@ -121,10 +164,10 @@ function App() {
     setWorker(fetchedWorker);
     setSettings(fetchedSettings);
     if (!settingsOpen || !settingsDirty) {
-      setSettingsDraft(fetchedSettings);
+      setSettingsDraft((currentDraft) => mergeSettingsDraft(fetchedSettings, currentDraft));
       setSettingsDirty(false);
     }
-  }, [settingsDirty, settingsOpen]);
+  }, [mergeSettingsDraft, settingsDirty, settingsOpen]);
 
   const loadLogs = useCallback(async () => {
     const fetchedLogs = await callApi<OperationLog[]>("/api/ops?limit=120");
@@ -168,10 +211,10 @@ function App() {
     runAction("start", async () => {
       const savedSettings = await callApi<Settings>("/api/settings", {
         method: "PATCH",
-        body: JSON.stringify(settingsDraft)
+        body: JSON.stringify(settingsPayload)
       });
       setSettings(savedSettings);
-      setSettingsDraft(savedSettings);
+      setSettingsDraft((currentDraft) => mergeSettingsDraft(savedSettings, currentDraft));
       setSettingsDirty(false);
       await callApi("/api/worker/start", {
         method: "POST",
@@ -191,10 +234,10 @@ function App() {
     runAction("save-settings", async () => {
       const savedSettings = await callApi<Settings>("/api/settings", {
         method: "PATCH",
-        body: JSON.stringify(settingsDraft)
+        body: JSON.stringify(settingsPayload)
       });
       setSettings(savedSettings);
-      setSettingsDraft(savedSettings);
+      setSettingsDraft((currentDraft) => mergeSettingsDraft(savedSettings, currentDraft));
       setSettingsDirty(false);
     });
 
@@ -212,7 +255,7 @@ function App() {
               setSettingsOpen((current) => {
                 const next = !current;
                 if (next) {
-                  setSettingsDraft(settings);
+                  setSettingsDraft((currentDraft) => mergeSettingsDraft(settings, currentDraft));
                   setSettingsDirty(false);
                 }
                 return next;
@@ -236,6 +279,7 @@ function App() {
                 <div className="settings-group-header">
                   <h4>Navidrome</h4>
                 </div>
+                <p className="status">Password is persisted in encrypted form and never sent back to the UI after save.</p>
                 <div className="controls-grid">
                   <div className="field">
                     <label htmlFor="navidromeUrl">Navidrome URL</label>
@@ -271,7 +315,7 @@ function App() {
                         setSettingsDraft((prev) => ({ ...prev, navidromePassword: event.target.value }));
                         setSettingsDirty(true);
                       }}
-                      placeholder="password"
+                      placeholder={settingsDraft.hasNavidromePassword ? "saved securely" : "enter password"}
                     />
                   </div>
                 </div>
@@ -281,6 +325,7 @@ function App() {
                 <div className="settings-group-header">
                   <h4>API Keys</h4>
                 </div>
+                <p className="status">API keys are persisted in encrypted form and stay masked here after save.</p>
                 <div className="controls-grid">
                   <div className="field">
                     <label htmlFor="lastFmApiKey">Last.fm API Key</label>
@@ -292,7 +337,7 @@ function App() {
                         setSettingsDraft((prev) => ({ ...prev, lastFmApiKey: event.target.value }));
                         setSettingsDirty(true);
                       }}
-                      placeholder="lastfm-api-key"
+                      placeholder={settingsDraft.hasLastFmApiKey ? "saved securely" : "enter Last.fm key"}
                     />
                   </div>
                   <div className="field">
@@ -305,7 +350,7 @@ function App() {
                         setSettingsDraft((prev) => ({ ...prev, geminiApiKey: event.target.value }));
                         setSettingsDirty(true);
                       }}
-                      placeholder="gemini-api-key"
+                      placeholder={settingsDraft.hasGeminiApiKey ? "saved securely" : "enter Gemini key"}
                     />
                   </div>
                   <div className="field">

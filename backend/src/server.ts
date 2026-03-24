@@ -2,7 +2,7 @@ import cors from "cors";
 import Database from "better-sqlite3";
 import { config } from "dotenv";
 import express from "express";
-import { createHash, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,6 +129,8 @@ const defaultLastFmApiKey = process.env.LASTFM_API_KEY ?? "";
 const defaultGeminiApiKey = process.env.GEMINI_API_KEY ?? "";
 const defaultGeminiModel = process.env.GEMINI_MODEL ?? "gemini-flash-lite-latest";
 const defaultMaxTracksPerPlaylist = Math.max(5, Math.min(100, Number(process.env.MAX_TRACKS_PER_PLAYLIST ?? 20)));
+const settingsKeyFile = process.env.SORTIFY_SETTINGS_KEY_FILE ?? path.resolve(path.dirname(dbFile), ".sortify-settings.key");
+const encryptedSettingPrefix = "enc-v1";
 const scanJobs = new Map<string, ScanProgress>();
 const operationLogs: OperationLogEntry[] = [];
 let activeScanJobId: string | null = null;
@@ -170,6 +172,67 @@ function appendLog(entry: Omit<OperationLogEntry, "id" | "timestamp">) {
 function normalizeGeminiModel(value: string): string {
   const normalized = value.trim().replace(/^models\//, "");
   return normalized || defaultGeminiModel;
+}
+
+function getSettingsEncryptionKey() {
+  const configuredKey = process.env.SORTIFY_SETTINGS_KEY?.trim();
+  if (configuredKey) {
+    return scryptSync(configuredKey, "sortify-settings", 32);
+  }
+  fs.mkdirSync(path.dirname(settingsKeyFile), { recursive: true });
+  if (fs.existsSync(settingsKeyFile)) {
+    const storedKey = Buffer.from(fs.readFileSync(settingsKeyFile, "utf8").trim(), "base64");
+    if (storedKey.length !== 32) {
+      throw new Error(`Invalid settings key file: ${settingsKeyFile}`);
+    }
+    return storedKey;
+  }
+  const generatedKey = randomBytes(32);
+  fs.writeFileSync(settingsKeyFile, generatedKey.toString("base64"), { mode: 0o600 });
+  fs.chmodSync(settingsKeyFile, 0o600);
+  return generatedKey;
+}
+
+const settingsEncryptionKey = getSettingsEncryptionKey();
+
+function encryptSettingValue(value: string) {
+  if (!value) {
+    return "";
+  }
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", settingsEncryptionKey, iv);
+  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return [
+    encryptedSettingPrefix,
+    iv.toString("base64"),
+    authTag.toString("base64"),
+    encrypted.toString("base64")
+  ].join(":");
+}
+
+function decryptSettingValue(value: string) {
+  if (!value) {
+    return { value: "", needsMigration: false };
+  }
+  if (!value.startsWith(`${encryptedSettingPrefix}:`)) {
+    return { value, needsMigration: true };
+  }
+  const [prefix, ivBase64, authTagBase64, encryptedBase64] = value.split(":");
+  if (!prefix || !ivBase64 || !authTagBase64 || !encryptedBase64) {
+    throw new Error("Invalid encrypted setting payload");
+  }
+  const decipher = createDecipheriv(
+    "aes-256-gcm",
+    settingsEncryptionKey,
+    Buffer.from(ivBase64, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(authTagBase64, "base64"));
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(encryptedBase64, "base64")),
+    decipher.final()
+  ]);
+  return { value: decrypted.toString("utf8"), needsMigration: false };
 }
 
 fs.mkdirSync(path.dirname(dbFile), { recursive: true });
@@ -298,11 +361,27 @@ function loadPersistedSettings() {
   const rows = readAllSettingsStmt.all() as Array<{ key: string; value: string }>;
   const persisted = new Map(rows.map((row) => [row.key, row.value]));
   const read = (key: string) => persisted.get(key);
+  let secretsNeedMigration = false;
   settings.navidromeUrl = read("navidromeUrl") ?? settings.navidromeUrl;
   settings.navidromeUsername = read("navidromeUsername") ?? settings.navidromeUsername;
-  settings.navidromePassword = read("navidromePassword") ?? settings.navidromePassword;
-  settings.lastFmApiKey = read("lastFmApiKey") ?? settings.lastFmApiKey;
-  settings.geminiApiKey = read("geminiApiKey") ?? settings.geminiApiKey;
+  const persistedNavidromePassword = read("navidromePassword");
+  if (persistedNavidromePassword !== undefined) {
+    const decrypted = decryptSettingValue(persistedNavidromePassword);
+    settings.navidromePassword = decrypted.value;
+    secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
+  }
+  const persistedLastFmApiKey = read("lastFmApiKey");
+  if (persistedLastFmApiKey !== undefined) {
+    const decrypted = decryptSettingValue(persistedLastFmApiKey);
+    settings.lastFmApiKey = decrypted.value;
+    secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
+  }
+  const persistedGeminiApiKey = read("geminiApiKey");
+  if (persistedGeminiApiKey !== undefined) {
+    const decrypted = decryptSettingValue(persistedGeminiApiKey);
+    settings.geminiApiKey = decrypted.value;
+    secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
+  }
   settings.geminiModel = normalizeGeminiModel(read("geminiModel") ?? settings.geminiModel);
   const weekly = Number.parseInt(read("weeklyPlaylistCount") ?? "", 10);
   if (!Number.isNaN(weekly)) {
@@ -313,15 +392,18 @@ function loadPersistedSettings() {
     settings.maxTracksPerPlaylist = clamp(maxTracks, 5, 100);
   }
   workerState.weeklyPlaylistCount = settings.weeklyPlaylistCount;
+  if (secretsNeedMigration) {
+    persistSettings();
+  }
 }
 
 function persistSettings() {
   const transaction = db.transaction(() => {
     upsertSettingStmt.run("navidromeUrl", settings.navidromeUrl);
     upsertSettingStmt.run("navidromeUsername", settings.navidromeUsername);
-    upsertSettingStmt.run("navidromePassword", settings.navidromePassword);
-    upsertSettingStmt.run("lastFmApiKey", settings.lastFmApiKey);
-    upsertSettingStmt.run("geminiApiKey", settings.geminiApiKey);
+    upsertSettingStmt.run("navidromePassword", encryptSettingValue(settings.navidromePassword));
+    upsertSettingStmt.run("lastFmApiKey", encryptSettingValue(settings.lastFmApiKey));
+    upsertSettingStmt.run("geminiApiKey", encryptSettingValue(settings.geminiApiKey));
     upsertSettingStmt.run("geminiModel", settings.geminiModel);
     upsertSettingStmt.run("weeklyPlaylistCount", String(settings.weeklyPlaylistCount));
     upsertSettingStmt.run("maxTracksPerPlaylist", String(settings.maxTracksPerPlaylist));
@@ -1644,9 +1726,12 @@ function settingsSnapshot() {
   return {
     navidromeUrl: settings.navidromeUrl,
     navidromeUsername: settings.navidromeUsername,
-    navidromePassword: settings.navidromePassword,
-    lastFmApiKey: settings.lastFmApiKey,
-    geminiApiKey: settings.geminiApiKey,
+    navidromePassword: "",
+    hasNavidromePassword: Boolean(settings.navidromePassword),
+    lastFmApiKey: "",
+    hasLastFmApiKey: Boolean(settings.lastFmApiKey),
+    geminiApiKey: "",
+    hasGeminiApiKey: Boolean(settings.geminiApiKey),
     geminiModel: settings.geminiModel,
     weeklyPlaylistCount: settings.weeklyPlaylistCount,
     maxTracksPerPlaylist: settings.maxTracksPerPlaylist
