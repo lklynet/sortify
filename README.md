@@ -6,6 +6,10 @@
 
 It's is a self-hosted playlist assistant for Navidrome. It scans your library, stores metadata locally, and generates AI-recommended playlists from the web UI. It does NOT touch your files metadata and instead stores it in a local SQLite database, keeping your files safe and untouched.
 
+## Screenshot
+
+![Sortify app screenshot](./.github/assets/screenshot-1.webp)
+
 ## Requirements
 
 - Navidrome
