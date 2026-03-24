@@ -1,0 +1,19 @@
+{
+  "name": "sortify",
+  "version": "0.1.0",
+  "description": "Self-hosted music tagging and playlist generation for Navidrome",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm --prefix backend run dev\" \"npm --prefix frontend run dev\"",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "lint": "npm --prefix backend run lint && npm --prefix frontend run lint",
+    "typecheck": "npm --prefix backend run typecheck && npm --prefix frontend run typecheck",
+    "start": "npm --prefix backend run start"
+  },
+  "keywords": [],
+  "author": "lklynet",
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

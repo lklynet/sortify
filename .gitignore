@@ -1,0 +1,17 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea
+.vscode/*
+!.vscode/extensions.json
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+backend/dist/
+frontend/dist/
+coverage/
+*.log
+backend/data/*.db
+backend/data/*.db-shm
+backend/data/*.db-wal

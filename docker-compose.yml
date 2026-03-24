@@ -1,0 +1,8 @@
+services:
+  sortify:
+    image: "ghcr.io/lklynet/sortify:latest"
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    volumes:
+      - ./data:/data

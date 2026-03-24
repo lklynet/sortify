@@ -1,0 +1,51 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
+
+:root {
+  --text: #f3f5f7;
+  --text-muted: #b6bcc3;
+  --bg: #303030;
+  --bg-elevated: #383838;
+  --surface: #424242;
+  --surface-hover: #4a4a4a;
+  --surface-soft: #3a3a3a;
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --accent: #2979ff;
+  --accent-hover: #4b90ff;
+  --accent-text: #f4f8ff;
+  --secondary: #8f9bad;
+  --button-bg: #2979ff;
+  --button-text: #f4f8ff;
+  --button-disabled: #565656;
+  --button-disabled-text: #a1a1a1;
+  --panel-input: #343434;
+  --shadow-lg: 0 22px 50px rgba(1, 7, 16, 0.42);
+  --shadow-md: 0 10px 24px rgba(1, 7, 16, 0.22);
+  --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --radius-sm: 10px;
+  --radius-md: 4px;
+  --radius-lg: 18px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background: var(--bg);
+  font-family: var(--sans);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
