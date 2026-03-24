@@ -318,7 +318,7 @@ function App() {
                         setSettingsDraft((prev) => ({ ...prev, navidromePassword: event.target.value }));
                         setSettingsDirty(true);
                       }}
-                      placeholder={settingsDraft.hasNavidromePassword ? "saved securely" : "enter password"}
+                      placeholder={settingsDraft.hasNavidromePassword ? "****************" : "enter password"}
                     />
                   </div>
                 </div>
@@ -340,7 +340,7 @@ function App() {
                         setSettingsDraft((prev) => ({ ...prev, lastFmApiKey: event.target.value }));
                         setSettingsDirty(true);
                       }}
-                      placeholder={settingsDraft.hasLastFmApiKey ? "saved securely" : "enter Last.fm key"}
+                      placeholder={settingsDraft.hasLastFmApiKey ? "****************" : "enter Last.fm key"}
                     />
                   </div>
                   <div className="field">
@@ -353,7 +353,7 @@ function App() {
                         setSettingsDraft((prev) => ({ ...prev, geminiApiKey: event.target.value }));
                         setSettingsDirty(true);
                       }}
-                      placeholder={settingsDraft.hasGeminiApiKey ? "saved securely" : "enter Gemini key"}
+                      placeholder={settingsDraft.hasGeminiApiKey ? "****************" : "enter Gemini key"}
                     />
                   </div>
                   <div className="field">
