@@ -1,7 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-type Stats = { tracks: number; playlists: number };
+type Stats = { tracks: number; playlists: number; analyzedTracks: number };
+type AudioFeatures = {
+  bpm: number | null;
+  energy: number;
+  danceability: number;
+  valence: number;
+  acousticness: number;
+  instrumentalness: number;
+  brightness: number;
+  rhythmicDensity: number;
+  loudness: number;
+  moodTags: string[];
+  durationSampled: number;
+};
 type OperationLog = {
   id: string;
   timestamp: string;
@@ -18,7 +31,16 @@ type Playlist = {
   updated_at: string;
   tracks: Array<{ id: number; title: string; artist: string; album: string; path: string }>;
 };
-type Track = { id: number; title: string; artist: string; album: string; tags: string[] };
+type Track = {
+  id: number;
+  title: string;
+  artist: string;
+  album: string;
+  tags: string[];
+  audioFeatures: AudioFeatures | null;
+  audioVector: number[];
+  analysis_updated_at?: string | null;
+};
 type WorkerState = {
   running: boolean;
   cycleRunning: boolean;
@@ -57,6 +79,18 @@ async function callApi<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+function formatPercent(value: number) {
+  return `${Math.round((Number.isFinite(value) ? value : 0) * 100)}%`;
+}
+
+function formatBpm(value: number | null) {
+  return value && Number.isFinite(value) ? `${Math.round(value)} BPM` : "BPM n/a";
+}
+
+function hasAudioAnalysis(track: Track) {
+  return Boolean(track.audioFeatures && Array.isArray(track.audioFeatures.moodTags));
+}
+
 function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>({
@@ -86,7 +120,7 @@ function App() {
     maxTracksPerPlaylist: 20
   });
   const [settingsDirty, setSettingsDirty] = useState(false);
-  const [stats, setStats] = useState<Stats>({ tracks: 0, playlists: 0 });
+  const [stats, setStats] = useState<Stats>({ tracks: 0, playlists: 0, analyzedTracks: 0 });
   const [logs, setLogs] = useState<OperationLog[]>([]);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
@@ -108,6 +142,7 @@ function App() {
     }),
     [settingsDraft.geminiApiKey, settingsDraft.hasGeminiApiKey, settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
   );
+  const recentAnalyzedTracks = useMemo(() => tracks.filter((track) => hasAudioAnalysis(track)).length, [tracks]);
   const mergeSettingsDraft = useCallback(
     (nextSettings: Settings, currentDraft: Settings) => ({
       ...nextSettings,
@@ -438,6 +473,7 @@ function App() {
             <span className={`signal ${hasSubsonicConnection ? "ok" : "bad"}`}>Navidrome {hasSubsonicConnection ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.gemini ? "ok" : "bad"}`}>Gemini {keyStatus.gemini ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.lastfm ? "ok" : "warn"}`}>Last.fm {keyStatus.lastfm ? "Ready" : "Optional"}</span>
+            <span className={`signal ${stats.analyzedTracks ? "ok" : "warn"}`}>Analyzed {stats.analyzedTracks}/{stats.tracks}</span>
             <span className="signal neutral">Playlists/Week {settings.weeklyPlaylistCount}</span>
             <span className="signal neutral">Max Tracks {settings.maxTracksPerPlaylist}</span>
           </div>
@@ -456,19 +492,50 @@ function App() {
       <section className="content-grid">
         <article className="panel">
           <div className="panel-header">
-            <h3>Recent tagged tracks · {tracks.length} / {stats.tracks}</h3>
+            <h3>Recent tagged tracks · {tracks.length} / {stats.tracks} · analyzed {recentAnalyzedTracks}</h3>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
             <ul className="trackList">
               {tracks.map((track) => (
                 <li key={track.id}>
-                  <div>
-                    <strong>{track.title || "Unknown Title"}</strong>
-                    <span>
-                      {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
+                  {(() => {
+                    const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
+                    return (
+                      <>
+                  <div className="trackHead">
+                    <div>
+                      <strong>{track.title || "Unknown Title"}</strong>
+                      <span>
+                        {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
+                      </span>
+                    </div>
+                    <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
+                      {analysis ? "Analyzed" : "Metadata only"}
                     </span>
                   </div>
                   <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
+                  {analysis ? (
+                    <div className="analysisBlock">
+                      <div className="analysisMetrics">
+                        <span>{formatBpm(analysis.bpm)}</span>
+                        <span>Energy {formatPercent(analysis.energy)}</span>
+                        <span>Dance {formatPercent(analysis.danceability)}</span>
+                        <span>Valence {formatPercent(analysis.valence)}</span>
+                      </div>
+                      <div className="analysisTags">
+                        {(analysis.moodTags ?? []).slice(0, 4).map((tag) => (
+                          <span key={tag}>{tag}</span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="analysisFallback">
+                      Audio analysis is not available for this track yet.
+                    </p>
+                  )}
+                      </>
+                    );
+                  })()}
                 </li>
               ))}
             </ul>

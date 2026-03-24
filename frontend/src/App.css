@@ -430,6 +430,13 @@ button:disabled {
   display: block;
 }
 
+.trackHead {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
 .trackList span,
 .playlistHead span {
   color: var(--text-muted);
@@ -441,6 +448,62 @@ button:disabled {
   color: var(--secondary);
   font-size: 0.74rem;
   line-height: 1.45;
+}
+
+.trackAnalysisPill {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 0.28rem 0.55rem;
+  font-size: 0.64rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.trackAnalysisPill.on {
+  color: #dbe7ff;
+  background: rgba(41, 121, 255, 0.14);
+}
+
+.trackAnalysisPill.off {
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.analysisBlock {
+  margin-top: 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.analysisMetrics,
+.analysisTags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.analysisMetrics span,
+.analysisTags span {
+  border-radius: 999px;
+  padding: 0.22rem 0.52rem;
+  font-size: 0.66rem;
+}
+
+.analysisMetrics span {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+}
+
+.analysisTags span {
+  background: rgba(41, 121, 255, 0.12);
+  color: #dbe7ff;
+}
+
+.analysisFallback {
+  margin-top: 0.6rem;
+  color: var(--text-muted);
+  font-size: 0.72rem;
 }
 
 .playlistHead {
@@ -486,6 +549,11 @@ button:disabled {
   .primary-top {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .trackHead {
+    flex-direction: column;
+    gap: 0.55rem;
   }
 
   .brand-lockup {

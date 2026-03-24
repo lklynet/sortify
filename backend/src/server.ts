@@ -2,6 +2,7 @@ import cors from "cors";
 import Database from "better-sqlite3";
 import { config } from "dotenv";
 import express from "express";
+import { spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -16,6 +17,10 @@ type TrackRecord = {
   year: number | null;
   duration: number | null;
   tags_json: string;
+  audio_features_json: string;
+  audio_vector_json: string;
+  analysis_version: string | null;
+  analysis_updated_at: string | null;
 };
 
 type PlaylistRecord = {
@@ -35,6 +40,9 @@ type PlaylistCandidate = {
   slug: string;
   description: string;
   trackIds: number[];
+  source: "ai" | "mood" | "artist" | "discovery";
+  signatureTags: string[];
+  audioVector: number[];
 };
 
 type AiPlaylistPlan = {
@@ -105,6 +113,21 @@ type SubsonicSong = {
   genre?: string;
 };
 
+type AudioAnalysis = {
+  version: string;
+  durationSampled: number;
+  bpm: number | null;
+  energy: number;
+  danceability: number;
+  valence: number;
+  acousticness: number;
+  instrumentalness: number;
+  brightness: number;
+  rhythmicDensity: number;
+  loudness: number;
+  moodTags: string[];
+};
+
 const envCandidates = [path.resolve(process.cwd(), ".env"), path.resolve(process.cwd(), "../.env")];
 for (const envFile of envCandidates) {
   if (fs.existsSync(envFile)) {
@@ -130,6 +153,11 @@ const defaultGeminiApiKey = process.env.GEMINI_API_KEY ?? "";
 const defaultGeminiModel = process.env.GEMINI_MODEL ?? "gemini-flash-lite-latest";
 const defaultMaxTracksPerPlaylist = Math.max(5, Math.min(100, Number(process.env.MAX_TRACKS_PER_PLAYLIST ?? 20)));
 const settingsKeyFile = process.env.SORTIFY_SETTINGS_KEY_FILE ?? path.resolve(path.dirname(dbFile), ".sortify-settings.key");
+const audioAnalysisScriptFile = path.resolve(serverDir, "../scripts/analyze_track.py");
+const audioAnalysisVersion = "audio-v1";
+const audioAnalysisEnabled = process.env.AUDIO_ANALYSIS_ENABLED !== "false";
+const audioAnalysisSampleSeconds = Math.max(30, Math.min(180, Number(process.env.AUDIO_ANALYSIS_SAMPLE_SECONDS ?? 90)));
+const audioAnalysisTimeoutMs = Math.max(10_000, Math.min(90_000, Number(process.env.AUDIO_ANALYSIS_TIMEOUT_MS ?? 25_000)));
 const encryptedSettingPrefix = "enc-v1";
 const scanJobs = new Map<string, ScanProgress>();
 const operationLogs: OperationLogEntry[] = [];
@@ -250,6 +278,10 @@ CREATE TABLE IF NOT EXISTS tracks (
   year INTEGER,
   duration REAL,
   tags_json TEXT NOT NULL DEFAULT '[]',
+  audio_features_json TEXT NOT NULL DEFAULT '{}',
+  audio_vector_json TEXT NOT NULL DEFAULT '[]',
+  analysis_version TEXT NOT NULL DEFAULT '',
+  analysis_updated_at TEXT,
   play_count INTEGER NOT NULL DEFAULT 0,
   favorite INTEGER NOT NULL DEFAULT 0,
   last_scanned_at TEXT NOT NULL
@@ -280,6 +312,21 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 `);
 
+const trackColumns = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
+const hasTrackColumn = (columnName: string) => trackColumns.some((column) => column.name === columnName);
+if (!hasTrackColumn("audio_features_json")) {
+  db.exec("ALTER TABLE tracks ADD COLUMN audio_features_json TEXT NOT NULL DEFAULT '{}'");
+}
+if (!hasTrackColumn("audio_vector_json")) {
+  db.exec("ALTER TABLE tracks ADD COLUMN audio_vector_json TEXT NOT NULL DEFAULT '[]'");
+}
+if (!hasTrackColumn("analysis_version")) {
+  db.exec("ALTER TABLE tracks ADD COLUMN analysis_version TEXT NOT NULL DEFAULT ''");
+}
+if (!hasTrackColumn("analysis_updated_at")) {
+  db.exec("ALTER TABLE tracks ADD COLUMN analysis_updated_at TEXT");
+}
+
 const playlistColumns = db.prepare("PRAGMA table_info(playlists)").all() as Array<{ name: string }>;
 const hasColumn = (columnName: string) => playlistColumns.some((column) => column.name === columnName);
 if (!hasColumn("updated_at")) {
@@ -304,15 +351,15 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const readTracksStmt = db.prepare(`
-SELECT id, path, title, artist, album, year, duration, tags_json
+SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at
 FROM tracks
 ORDER BY last_scanned_at DESC, id DESC
 LIMIT ?
 `);
 
 const upsertTrackStmt = db.prepare(`
-INSERT INTO tracks (path, title, artist, album, album_artist, year, duration, tags_json, last_scanned_at)
-VALUES (@path, @title, @artist, @album, @album_artist, @year, @duration, @tags_json, @last_scanned_at)
+INSERT INTO tracks (path, title, artist, album, album_artist, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at, last_scanned_at)
+VALUES (@path, @title, @artist, @album, @album_artist, @year, @duration, @tags_json, @audio_features_json, @audio_vector_json, @analysis_version, @analysis_updated_at, @last_scanned_at)
 ON CONFLICT(path) DO UPDATE SET
   title = excluded.title,
   artist = excluded.artist,
@@ -321,10 +368,14 @@ ON CONFLICT(path) DO UPDATE SET
   year = excluded.year,
   duration = excluded.duration,
   tags_json = excluded.tags_json,
+  audio_features_json = excluded.audio_features_json,
+  audio_vector_json = excluded.audio_vector_json,
+  analysis_version = excluded.analysis_version,
+  analysis_updated_at = excluded.analysis_updated_at,
   last_scanned_at = excluded.last_scanned_at
 `);
 const readTrackScanStateStmt = db.prepare(`
-SELECT path, title, artist, album, year, duration, tags_json
+SELECT path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at
 FROM tracks
 `);
 
@@ -391,6 +442,13 @@ function loadPersistedSettings() {
   if (!Number.isNaN(maxTracks)) {
     settings.maxTracksPerPlaylist = clamp(maxTracks, 5, 100);
   }
+  const workerRunning = read("workerRunning");
+  if (workerRunning !== undefined) {
+    workerState.running = workerRunning === "true";
+  }
+  workerState.lastRunAt = read("workerLastRunAt") || null;
+  workerState.lastRunWeek = read("workerLastRunWeek") || null;
+  workerState.error = read("workerError") || null;
   workerState.weeklyPlaylistCount = settings.weeklyPlaylistCount;
   if (secretsNeedMigration) {
     persistSettings();
@@ -407,11 +465,29 @@ function persistSettings() {
     upsertSettingStmt.run("geminiModel", settings.geminiModel);
     upsertSettingStmt.run("weeklyPlaylistCount", String(settings.weeklyPlaylistCount));
     upsertSettingStmt.run("maxTracksPerPlaylist", String(settings.maxTracksPerPlaylist));
+    upsertSettingStmt.run("workerRunning", String(workerState.running));
+    upsertSettingStmt.run("workerLastRunAt", workerState.lastRunAt ?? "");
+    upsertSettingStmt.run("workerLastRunWeek", workerState.lastRunWeek ?? "");
+    upsertSettingStmt.run("workerError", workerState.error ?? "");
   });
   transaction();
 }
 
 loadPersistedSettings();
+
+function syncWorkerConnectionFromSettings() {
+  if (settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword) {
+    workerConnection = {
+      baseUrl: settings.navidromeUrl,
+      username: settings.navidromeUsername,
+      password: settings.navidromePassword
+    };
+    return;
+  }
+  workerConnection = null;
+}
+
+syncWorkerConnectionFromSettings();
 
 const moodRules: Record<string, string[]> = {
   Chill: ["chill", "ambient", "downtempo", "dream", "lofi", "trip-hop", "calm"],
@@ -689,6 +765,9 @@ async function fetchGeminiPlaylistPlans(tracks: Array<{ title: string; artist: s
         maxPerArtistRange: [1, 2],
         requireMultiTagOverlap: true,
         avoidYearCentricGrouping: true,
+        requireDistinctPlans: true,
+        preferDifferentGenreMoodCenters: true,
+        maxSharedFocusTagsBetweenPlans: 2,
         namingStyle:
           "Use evocative, emotionally descriptive names grounded in the actual musical vibe and tags. Avoid plain genre-only names and avoid random nonsense."
       },
@@ -1080,6 +1159,123 @@ async function fetchMusicBrainzTags(artist: string, title: string): Promise<{ ta
   }
 }
 
+function clampUnit(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function buildSubsonicQuery(connection: SubsonicConnection, params: Record<string, string> = {}, includeFormat = true) {
+  const salt = randomUUID().replace(/-/g, "").slice(0, 12);
+  const token = createHash("md5").update(`${connection.password}${salt}`).digest("hex");
+  return new URLSearchParams({
+    u: connection.username,
+    t: token,
+    s: salt,
+    v: "1.16.1",
+    c: "sortify",
+    ...(includeFormat ? { f: "json" } : {}),
+    ...params
+  });
+}
+
+function buildSubsonicStreamUrl(connection: SubsonicConnection, songId: string) {
+  return `${connection.baseUrl}/rest/stream.view?${buildSubsonicQuery(connection, { id: songId }, false).toString()}`;
+}
+
+function audioFeaturesFromTrack(track: Pick<TrackRecord, "audio_features_json">): AudioAnalysis | null {
+  try {
+    const parsed = JSON.parse(track.audio_features_json) as AudioAnalysis;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function audioVectorFromTrack(track: Pick<TrackRecord, "audio_vector_json">): number[] {
+  try {
+    const parsed = JSON.parse(track.audio_vector_json) as number[];
+    return Array.isArray(parsed) ? parsed.filter((value) => Number.isFinite(value)).map((value) => Number(value)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function hasFreshAudioAnalysis(track: Pick<TrackRecord, "analysis_version" | "audio_features_json" | "audio_vector_json"> | undefined) {
+  if (!track || track.analysis_version !== audioAnalysisVersion) {
+    return false;
+  }
+  return Boolean(audioFeaturesFromTrack(track)?.moodTags?.length) && audioVectorFromTrack(track).length >= 8;
+}
+
+async function analyzeTrackAudio(connection: SubsonicConnection, songId: string): Promise<{ features: AudioAnalysis; vector: number[] } | null> {
+  if (!audioAnalysisEnabled || !fs.existsSync(audioAnalysisScriptFile)) {
+    return null;
+  }
+  const streamUrl = buildSubsonicStreamUrl(connection, songId);
+  return await new Promise((resolve, reject) => {
+    const child = spawn("python3", [audioAnalysisScriptFile, "--url", streamUrl, "--sample-seconds", String(audioAnalysisSampleSeconds)], {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, audioAnalysisTimeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      if (signal) {
+        reject(new Error("Audio analysis timed out"));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `Audio analysis exited with code ${code}`));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout.trim()) as { features?: AudioAnalysis; vector?: number[] };
+        const features = parsed.features;
+        const vector = Array.isArray(parsed.vector) ? parsed.vector.map((value) => clampUnit(Number(value))) : [];
+        if (!features || !Array.isArray(features.moodTags) || vector.length < 8) {
+          reject(new Error("Audio analysis returned invalid payload"));
+          return;
+        }
+        resolve({
+          features: {
+            ...features,
+            version: audioAnalysisVersion,
+            bpm: typeof features.bpm === "number" && Number.isFinite(features.bpm) ? features.bpm : null,
+            energy: clampUnit(Number(features.energy)),
+            danceability: clampUnit(Number(features.danceability)),
+            valence: clampUnit(Number(features.valence)),
+            acousticness: clampUnit(Number(features.acousticness)),
+            instrumentalness: clampUnit(Number(features.instrumentalness)),
+            brightness: clampUnit(Number(features.brightness)),
+            rhythmicDensity: clampUnit(Number(features.rhythmicDensity)),
+            loudness: clampUnit(Number(features.loudness)),
+            durationSampled: Math.max(1, Number(features.durationSampled) || audioAnalysisSampleSeconds),
+            moodTags: uniqueTags(features.moodTags.map((tag) => String(tag ?? "")))
+          },
+          vector
+        });
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error("Failed parsing audio analysis output"));
+      }
+    });
+  });
+}
+
 function getSubsonicConnection(input: unknown): SubsonicConnection {
   const body = (input ?? {}) as Record<string, unknown>;
   const baseUrl = String(body.baseUrl ?? settings.navidromeUrl).trim().replace(/\/+$/, "");
@@ -1092,17 +1288,7 @@ function getSubsonicConnection(input: unknown): SubsonicConnection {
 }
 
 async function subsonicRequest<T>(connection: SubsonicConnection, endpoint: string, params: Record<string, string> = {}): Promise<T> {
-  const salt = randomUUID().replace(/-/g, "").slice(0, 12);
-  const token = createHash("md5").update(`${connection.password}${salt}`).digest("hex");
-  const query = new URLSearchParams({
-    u: connection.username,
-    t: token,
-    s: salt,
-    v: "1.16.1",
-    c: "sortify",
-    f: "json",
-    ...params
-  });
+  const query = buildSubsonicQuery(connection, params);
   const response = await fetch(`${connection.baseUrl}/rest/${endpoint}?${query.toString()}`, {
     signal: AbortSignal.timeout(12000)
   });
@@ -1161,6 +1347,10 @@ async function scanLibrary(
     year: number | null;
     duration: number | null;
     tags_json: string;
+    audio_features_json: string;
+    audio_vector_json: string;
+    analysis_version: string | null;
+    analysis_updated_at: string | null;
   }>;
   const existingByPath = new Map<string, (typeof existingRows)[number]>();
   for (const row of existingRows) {
@@ -1186,14 +1376,20 @@ async function scanLibrary(
     const duration = song.duration ?? null;
     const trackPath = `subsonic:${song.id}`;
     const existing = existingByPath.get(trackPath);
-    const existingTags = existing ? tagsFromTrack({ ...existing, id: 0, path: trackPath, tags_json: existing.tags_json }) : [];
+    const existingTags = existing
+      ? tagsFromTrack({
+          ...existing,
+          id: 0,
+          path: trackPath
+        })
+      : [];
     const unchanged =
       existing &&
       (existing.title ?? "Unknown Title") === title &&
       (existing.artist ?? "Unknown Artist") === artist &&
       (existing.album ?? "Unknown Album") === album &&
       (existing.duration ?? null) === duration;
-    const shouldHydrate = !unchanged || existingTags.length < 6;
+    const shouldHydrate = !unchanged || existingTags.length < 6 || !hasFreshAudioAnalysis(existing);
     if (!shouldHydrate) {
       processed += 1;
       skipped += 1;
@@ -1205,9 +1401,27 @@ async function scanLibrary(
     try {
       const musicBrainz = await fetchMusicBrainzTags(artist, title);
       const mergedYear = year ?? musicBrainz.year ?? null;
-      const baseTags = deriveBaseTags(title, artist, mergedYear, song.genre ? [song.genre] : [], null);
+      const analyzedAudio = await analyzeTrackAudio(connection, song.id).catch((error) => {
+        appendLog({
+          level: "warn",
+          scope: "scan",
+          message: "Audio analysis skipped for track",
+          meta: { songId: song.id, title: song.title, error: error instanceof Error ? error.message : "Unknown error" }
+        });
+        return null;
+      });
+      const preservedAudio = existing
+        ? {
+            features: audioFeaturesFromTrack(existing),
+            vector: audioVectorFromTrack(existing)
+          }
+        : null;
+      const audioFeatures = analyzedAudio?.features ?? preservedAudio?.features ?? null;
+      const audioVector = analyzedAudio?.vector ?? preservedAudio?.vector ?? [];
+      const baseTags = deriveBaseTags(title, artist, mergedYear, song.genre ? [song.genre] : [], audioFeatures?.bpm ?? null);
       const lastFmTags = await fetchLastFmTags(artist, title, album);
-      const tags = uniqueTags([...baseTags, ...musicBrainz.tags, ...lastFmTags]);
+      const audioTags = audioFeatures?.moodTags ?? [];
+      const tags = uniqueTags([...baseTags, ...musicBrainz.tags, ...lastFmTags, ...audioTags]);
       upsertTrackStmt.run({
         path: trackPath,
         title,
@@ -1217,6 +1431,10 @@ async function scanLibrary(
         year: mergedYear,
         duration,
         tags_json: JSON.stringify(tags),
+        audio_features_json: JSON.stringify(audioFeatures ?? {}),
+        audio_vector_json: JSON.stringify(audioVector),
+        analysis_version: audioFeatures ? audioAnalysisVersion : existing?.analysis_version ?? "",
+        analysis_updated_at: audioFeatures ? now : existing?.analysis_updated_at ?? null,
         last_scanned_at: now
       });
       updated += 1;
@@ -1290,6 +1508,185 @@ function cosineScore(a: string[], b: string[]): number {
   return dot / Math.sqrt(magA * magB);
 }
 
+function cosineNumberScore(a: number[], b: number[]): number {
+  if (!a.length || !b.length || a.length !== b.length) {
+    return 0;
+  }
+  let dot = 0;
+  let magA = 0;
+  let magB = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index] * b[index];
+    magA += a[index] * a[index];
+    magB += b[index] * b[index];
+  }
+  if (magA === 0 || magB === 0) {
+    return 0;
+  }
+  return dot / Math.sqrt(magA * magB);
+}
+
+function averageAudioVector(trackIds: number[], audioVectorByTrackId: Map<number, number[]>): number[] {
+  const vectors = trackIds
+    .map((trackId) => audioVectorByTrackId.get(trackId) ?? [])
+    .filter((vector) => vector.length > 0);
+  if (!vectors.length) {
+    return [];
+  }
+  const length = vectors[0].length;
+  const sums = new Array<number>(length).fill(0);
+  let count = 0;
+  for (const vector of vectors) {
+    if (vector.length !== length) {
+      continue;
+    }
+    count += 1;
+    for (let index = 0; index < length; index += 1) {
+      sums[index] += vector[index];
+    }
+  }
+  if (!count) {
+    return [];
+  }
+  return sums.map((value) => value / count);
+}
+
+function topTagsFromTrackIds(trackIds: number[], primaryTagsByTrackId: Map<number, string[]>, limit: number): string[] {
+  const counts = new Map<string, number>();
+  for (const trackId of trackIds) {
+    for (const tag of primaryTagsByTrackId.get(trackId) ?? []) {
+      counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([tag]) => tag);
+}
+
+function jaccardScore(valuesA: Iterable<string | number>, valuesB: Iterable<string | number>): number {
+  const setA = new Set(valuesA);
+  const setB = new Set(valuesB);
+  if (!setA.size || !setB.size) {
+    return 0;
+  }
+  let overlap = 0;
+  for (const value of setA) {
+    if (setB.has(value)) {
+      overlap += 1;
+    }
+  }
+  return overlap / (setA.size + setB.size - overlap);
+}
+
+function selectPlaylistTracksForVariety(
+  trackIds: number[],
+  artistByTrackId: Map<number, string>,
+  globalArtistCounts: Map<string, number>,
+  globalTrackIds: Set<number>,
+  targetSize: number
+): number[] {
+  const selected: number[] = [];
+  const selectedSet = new Set<number>();
+  const playlistArtistCounts = new Map<string, number>();
+  const passes = [
+    { maxPlaylistArtistCount: maxArtistPerPlaylist, maxGlobalArtistCount: 0, allowRepeatedTracks: false },
+    { maxPlaylistArtistCount: maxArtistPerPlaylist, maxGlobalArtistCount: 1, allowRepeatedTracks: false },
+    { maxPlaylistArtistCount: maxArtistFallbackPerPlaylist, maxGlobalArtistCount: 2, allowRepeatedTracks: false },
+    { maxPlaylistArtistCount: maxArtistFallbackPerPlaylist, maxGlobalArtistCount: Number.POSITIVE_INFINITY, allowRepeatedTracks: true }
+  ];
+  for (const pass of passes) {
+    for (const trackId of trackIds) {
+      if (selected.length >= targetSize || selectedSet.has(trackId)) {
+        continue;
+      }
+      if (!pass.allowRepeatedTracks && globalTrackIds.has(trackId)) {
+        continue;
+      }
+      const artist = artistByTrackId.get(trackId) ?? `track-${trackId}`;
+      const playlistArtistCount = playlistArtistCounts.get(artist) ?? 0;
+      const globalArtistCount = globalArtistCounts.get(artist) ?? 0;
+      if (playlistArtistCount >= pass.maxPlaylistArtistCount || globalArtistCount > pass.maxGlobalArtistCount) {
+        continue;
+      }
+      selected.push(trackId);
+      selectedSet.add(trackId);
+      playlistArtistCounts.set(artist, playlistArtistCount + 1);
+    }
+  }
+  for (const trackId of selected) {
+    globalTrackIds.add(trackId);
+    const artist = artistByTrackId.get(trackId) ?? `track-${trackId}`;
+    globalArtistCounts.set(artist, (globalArtistCounts.get(artist) ?? 0) + 1);
+  }
+  return selected;
+}
+
+function selectDiverseCandidates(
+  candidates: PlaylistCandidate[],
+  playlistCount: number,
+  trackCount: number,
+  artistByTrackId: Map<number, string>,
+  primaryTagsByTrackId: Map<number, string[]>,
+  audioVectorByTrackId: Map<number, number[]>
+): PlaylistCandidate[] {
+  const candidateProfiles = candidates.map((candidate) => {
+    const artistSet = new Set(candidate.trackIds.map((trackId) => artistByTrackId.get(trackId) ?? `track-${trackId}`));
+    const signatureTags = candidate.signatureTags.length ? candidate.signatureTags : topTagsFromTrackIds(candidate.trackIds, primaryTagsByTrackId, 8);
+    const audioVector = candidate.audioVector.length ? candidate.audioVector : averageAudioVector(candidate.trackIds, audioVectorByTrackId);
+    const audioCoverage =
+      candidate.trackIds.filter((trackId) => (audioVectorByTrackId.get(trackId) ?? []).length > 0).length / Math.max(candidate.trackIds.length, 1);
+    const intrinsicScore =
+      Math.min(candidate.trackIds.length / Math.max(trackCount * 1.4, 1), 1) * 0.35 +
+      Math.min(signatureTags.length / 8, 1) * 0.25 +
+      Math.min(artistSet.size / Math.max(trackCount, 1), 1) * 0.2 +
+      audioCoverage * 0.2;
+    return {
+      candidate,
+      artistSet,
+      signatureTags,
+      audioVector,
+      intrinsicScore
+    };
+  });
+  const selected: typeof candidateProfiles = [];
+  while (selected.length < playlistCount && selected.length < candidateProfiles.length) {
+    const usedSources = new Set(selected.map((entry) => entry.candidate.source));
+    const next = candidateProfiles
+      .filter((entry) => !selected.includes(entry))
+      .map((entry) => {
+        if (!selected.length) {
+          return { entry, score: entry.intrinsicScore };
+        }
+        const similarities = selected.map((picked) => {
+          const trackOverlap = jaccardScore(entry.candidate.trackIds, picked.candidate.trackIds);
+          const artistOverlap = jaccardScore(entry.artistSet, picked.artistSet);
+          const tagSimilarity = cosineScore(entry.signatureTags, picked.signatureTags);
+          const audioSimilarity = cosineNumberScore(entry.audioVector, picked.audioVector);
+          return trackOverlap * 0.35 + artistOverlap * 0.25 + tagSimilarity * 0.25 + audioSimilarity * 0.15;
+        });
+        const maxSimilarity = Math.max(...similarities);
+        const averageSimilarity = similarities.reduce((total, value) => total + value, 0) / similarities.length;
+        const sourceBonus = usedSources.has(entry.candidate.source) ? 0 : 0.08;
+        return {
+          entry,
+          score: entry.intrinsicScore + sourceBonus - maxSimilarity * 0.85 - averageSimilarity * 0.3
+        };
+      })
+      .sort((a, b) => b.score - a.score)[0];
+    if (!next) {
+      break;
+    }
+    selected.push(next.entry);
+  }
+  const globalArtistCounts = new Map<string, number>();
+  const globalTrackIds = new Set<number>();
+  return selected.map(({ candidate }) => ({
+    ...candidate,
+    trackIds: selectPlaylistTracksForVariety(candidate.trackIds, artistByTrackId, globalArtistCounts, globalTrackIds, trackCount)
+  }));
+}
+
 function slugify(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
@@ -1302,11 +1699,13 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
   const candidates: PlaylistCandidate[] = [];
   const artistByTrackId = new Map<number, string>();
   const primaryTagsByTrackId = new Map<number, string[]>();
+  const audioVectorByTrackId = new Map<number, number[]>();
 
   for (const track of enriched) {
     artistByTrackId.set(track.id, track.artist ? normalizeTag(track.artist) : `track-${track.id}`);
     const primaryTags = uniqueTags(track.tags.filter((tag) => isPrimaryClusterTag(tag))).slice(0, 10);
     primaryTagsByTrackId.set(track.id, primaryTags);
+    audioVectorByTrackId.set(track.id, audioVectorFromTrack(track));
   }
 
   const aiPlans = await generateAiPlaylistPlans(
@@ -1342,7 +1741,10 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       name: plan.name,
       slug: slugify(plan.name),
       description: plan.description,
-      trackIds: pooled
+      trackIds: pooled,
+      source: "ai",
+      signatureTags: centroid,
+      audioVector: averageAudioVector(pooled, audioVectorByTrackId)
     });
   }
 
@@ -1366,7 +1768,10 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       name,
       slug: slugify(name),
       description: `${moodName} tracks ranked by tag similarity`,
-      trackIds: pooled
+      trackIds: pooled,
+      source: "mood",
+      signatureTags: uniqueTags(moodTags),
+      audioVector: averageAudioVector(pooled, audioVectorByTrackId)
     });
   }
 
@@ -1401,7 +1806,10 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       name,
       slug: slugify(name),
       description: `Artists and tracks sharing signature tags with ${seedArtist}`,
-      trackIds: pooled
+      trackIds: pooled,
+      source: "artist",
+      signatureTags: seedTags,
+      audioVector: averageAudioVector(pooled, audioVectorByTrackId)
     });
   }
 
@@ -1440,28 +1848,36 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       name: "Discovery Mix",
       slug: "discovery-mix",
       description: "Least-played tracks with high overlap to favorites",
-      trackIds: pooled
+      trackIds: pooled,
+      source: "discovery",
+      signatureTags: favoriteTags.slice(0, 8),
+      audioVector: averageAudioVector(pooled, audioVectorByTrackId)
     });
   }
 
   const limitedPlaylistCount = clamp(desiredWeeklyPlaylists, 1, 5);
   const limitedTrackCount = clamp(settings.maxTracksPerPlaylist, 5, 100);
   const minimumTrackCount = Math.min(limitedTrackCount, 12);
-  return candidates
+  return selectDiverseCandidates(
+    candidates
+      .map((candidate, index) => ({
+        ...candidate,
+        slug: candidate.slug || `weekly-${index + 1}`,
+        trackIds: [...new Set(candidate.trackIds)].slice(0, playlistPoolTargetSize)
+      }))
+      .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
+      .filter((candidate, index, list) => list.findIndex((entry) => entry.slug === candidate.slug) === index),
+    limitedPlaylistCount,
+    limitedTrackCount,
+    artistByTrackId,
+    primaryTagsByTrackId,
+    audioVectorByTrackId
+  )
+    .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
     .map((candidate, index) => ({
       ...candidate,
-      slug: candidate.slug || `weekly-${index + 1}`,
-      trackIds: limitTracksByArtist(
-        [...new Set(candidate.trackIds)],
-        artistByTrackId,
-        maxArtistPerPlaylist,
-        limitedTrackCount,
-        maxArtistFallbackPerPlaylist
-      )
-    }))
-    .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
-    .filter((candidate, index, list) => list.findIndex((entry) => entry.slug === candidate.slug) === index)
-    .slice(0, limitedPlaylistCount);
+      slug: candidate.slug || `weekly-${index + 1}`
+    }));
 }
 
 function replacePlaylists(candidates: PlaylistCandidate[]) {
@@ -1612,7 +2028,9 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
 }
 
 async function refreshRecommendedPlaylists(weeklyPlaylistCount = workerState.weeklyPlaylistCount) {
-  const tracks = db.prepare("SELECT id, path, title, artist, album, year, duration, tags_json FROM tracks").all() as TrackRecord[];
+  const tracks = db
+    .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at FROM tracks")
+    .all() as TrackRecord[];
   const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
   const candidates = await generateCandidates(syncableTracks, weeklyPlaylistCount);
   replacePlaylists(candidates);
@@ -1659,6 +2077,7 @@ async function runWorkerCycle(trigger: "start" | "weekly"): Promise<void> {
     workerState.lastRunAt = new Date().toISOString();
     workerState.lastRunWeek = isoWeekKey();
     setWorkerScheduleHints();
+    persistSettings();
     appendLog({
       level: "info",
       scope: "system",
@@ -1667,6 +2086,7 @@ async function runWorkerCycle(trigger: "start" | "weekly"): Promise<void> {
     });
   } catch (error) {
     workerState.error = error instanceof Error ? error.message : "Worker cycle failed";
+    persistSettings();
     appendLog({
       level: "error",
       scope: "system",
@@ -1707,6 +2127,45 @@ function stopWorkerScheduler() {
   workerState.running = false;
   workerState.cycleRunning = false;
   workerState.nextRunAt = null;
+}
+
+function resumeWorkerSchedulerFromPersistence() {
+  if (!workerState.running) {
+    setWorkerScheduleHints();
+    return;
+  }
+  if (!workerConnection) {
+    workerState.running = false;
+    workerState.error = "Worker could not resume because Navidrome settings are incomplete";
+    setWorkerScheduleHints();
+    persistSettings();
+    appendLog({
+      level: "warn",
+      scope: "system",
+      message: "Worker resume skipped",
+      meta: { reason: "missing_connection_settings" }
+    });
+    return;
+  }
+  workerState.error = null;
+  setWorkerScheduleHints();
+  startWorkerScheduler();
+  appendLog({
+    level: "info",
+    scope: "system",
+    message: "Worker resumed from persisted state",
+    meta: { weeklyPlaylistCount: workerState.weeklyPlaylistCount, source: workerConnection.baseUrl }
+  });
+  void tickWorker().catch((error) => {
+    workerState.error = error instanceof Error ? error.message : "Worker resume tick failed";
+    persistSettings();
+    appendLog({
+      level: "error",
+      scope: "system",
+      message: "Worker resume tick failed",
+      meta: { error: workerState.error }
+    });
+  });
 }
 
 function workerSnapshot() {
@@ -1773,12 +2232,13 @@ app.patch("/api/settings", (req, res) => {
   if (body.maxTracksPerPlaylist !== undefined) {
     settings.maxTracksPerPlaylist = clamp(Number(body.maxTracksPerPlaylist), 5, 100);
   }
-  if (workerConnection && settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword) {
-    workerConnection = {
-      baseUrl: settings.navidromeUrl,
-      username: settings.navidromeUsername,
-      password: settings.navidromePassword
-    };
+  syncWorkerConnectionFromSettings();
+  if (workerState.running && !workerConnection) {
+    stopWorkerScheduler();
+    workerState.error = "Worker stopped because Navidrome settings are incomplete";
+  } else if (workerState.running) {
+    setWorkerScheduleHints();
+    workerState.error = null;
   }
   persistSettings();
   appendLog({
@@ -1793,7 +2253,10 @@ app.patch("/api/settings", (req, res) => {
 app.get("/api/stats", (_req, res) => {
   const trackCount = db.prepare("SELECT COUNT(*) as count FROM tracks").get() as { count: number };
   const playlistCount = db.prepare("SELECT COUNT(*) as count FROM playlists").get() as { count: number };
-  res.json({ tracks: trackCount.count, playlists: playlistCount.count });
+  const analyzedTrackCount = db
+    .prepare("SELECT COUNT(*) as count FROM tracks WHERE analysis_version = ? AND audio_vector_json != '[]'")
+    .get(audioAnalysisVersion) as { count: number };
+  res.json({ tracks: trackCount.count, playlists: playlistCount.count, analyzedTracks: analyzedTrackCount.count });
 });
 
 app.get("/api/ops", (req, res) => {
@@ -1808,7 +2271,9 @@ app.get("/api/tracks", (req, res) => {
   res.json(
     rows.map((row) => ({
       ...row,
-      tags: tagsFromTrack(row)
+      tags: tagsFromTrack(row),
+      audioFeatures: audioFeaturesFromTrack(row),
+      audioVector: audioVectorFromTrack(row)
     }))
   );
 });
@@ -1832,10 +2297,10 @@ app.post("/api/worker/start", (req, res) => {
   settings.navidromeUrl = connection.baseUrl;
   settings.navidromeUsername = connection.username;
   settings.navidromePassword = connection.password;
-  persistSettings();
   workerState.running = true;
   workerState.error = null;
   setWorkerScheduleHints();
+  persistSettings();
   startWorkerScheduler();
   void runWorkerCycle("start").catch(() => null);
   appendLog({
@@ -1849,6 +2314,7 @@ app.post("/api/worker/start", (req, res) => {
 
 app.post("/api/worker/stop", (_req, res) => {
   stopWorkerScheduler();
+  persistSettings();
   appendLog({
     level: "info",
     scope: "system",
@@ -2121,6 +2587,8 @@ if (frontendDistDir) {
     res.sendFile(path.join(frontendDistDir, "index.html"));
   });
 }
+
+resumeWorkerSchedulerFromPersistence();
 
 app.listen(port, () => {
   console.log(`Sortify backend listening on http://localhost:${port}`);
