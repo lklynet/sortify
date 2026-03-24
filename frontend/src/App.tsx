@@ -244,8 +244,11 @@ function App() {
   return (
     <main className="layout">
       <header className="app-header">
-        <div className="app-title">
-          <h1>Sortify</h1>
+        <div className="brand-lockup">
+          <img className="app-logo" src="/sortify_logo.svg" alt="Sortify" />
+          <div className="app-title">
+            <h1>Sortify</h1>
+          </div>
         </div>
         <div className="header-controls">
           <span className={`worker-pill ${worker?.running ? "on" : "off"}`}>{worker?.running ? "Worker On" : "Worker Off"}</span>

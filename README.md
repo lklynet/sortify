@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./frontend/public/sortify_logo.svg" alt="Sortify" width="180" />
+</p>
+
 # Sortify
 
 It's is a self-hosted playlist assistant for Navidrome. It scans your library, stores metadata locally, and generates AI-recommended playlists from the web UI. It does NOT touch your files metadata and instead stores it in a local SQLite database, keeping your files safe and untouched.
