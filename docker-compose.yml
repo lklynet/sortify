@@ -1,6 +1,7 @@
 services:
   sortify:
     image: "ghcr.io/lklynet/sortify:latest"
+    container_name: sortify
     environment:
       PORT: 3001
       SUBSONIC_URL: ${SUBSONIC_URL:-}

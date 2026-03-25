@@ -21,6 +21,7 @@ It's is a self-hosted playlist assistant for Navidrome. It scans your library, s
 services:
   sortify:
     image: "ghcr.io/lklynet/sortify:latest"
+    container_name: sortify
     ports:
       - "3001:3001"
     restart: unless-stopped
