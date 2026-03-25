@@ -626,7 +626,6 @@ function App() {
                     <div>
                       <div className="playlistHead">
                         <strong>{playlist.name}</strong>
-                        <span>{playlist.tracks.length} tracks</span>
                       </div>
                     </div>
                     {(() => {
@@ -650,7 +649,7 @@ function App() {
                   </div>
                   <p>{playlist.description}</p>
                   <div className="playlistTracks">
-                    {playlist.tracks.slice(0, 5).map((track) => (
+                    {playlist.tracks.map((track) => (
                       <span key={track.id}>
                         {track.title || "Untitled"} — {track.artist || "Unknown"}
                       </span>

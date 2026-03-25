@@ -607,6 +607,13 @@ button:disabled {
   justify-content: space-between;
   align-items: flex-start;
   gap: 1rem;
+  position: relative;
+}
+
+.playlistTopRow > div {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-right: 2.5rem;
 }
 
 .playlistModeToggle {
@@ -617,6 +624,9 @@ button:disabled {
   align-items: center;
   justify-content: center;
   font-size: 0.94rem;
+  position: absolute;
+  top: 0;
+  right: 0;
 }
 
 .playlistModeIcon {
@@ -651,6 +661,8 @@ button:disabled {
   flex-wrap: wrap;
   gap: 0.35rem;
   margin-top: 0.6rem;
+  max-height: 1.25rem;
+  overflow: hidden;
 }
 
 .playlistTracks span {
@@ -658,6 +670,7 @@ button:disabled {
   border-radius: 999px;
   padding: 0.2rem 0.5rem;
   font-size: 0.68rem;
+  line-height: 1.25;
   color: var(--text-muted);
 }
 
@@ -690,6 +703,15 @@ button:disabled {
 
   .playlistTopRow {
     flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  .playlistTopRow > div {
+    padding-right: 0;
+  }
+
+  .playlistModeToggle {
+    position: static;
   }
 
   .brand-lockup {
