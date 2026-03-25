@@ -151,6 +151,7 @@ const operationLogs: OperationLogEntry[] = [];
 let activeScanJobId: string | null = null;
 let workerConnection: SubsonicConnection | null = null;
 let workerTimer: NodeJS.Timeout | null = null;
+let previousRecommendedPlaylistNamesBySlug = new Map<string, string>();
 const workerTickMs = 60_000;
 const workerState: WorkerState = {
   running: false,
@@ -824,7 +825,7 @@ function inferNamingPools(signatureTags: string[], audioVector: number[]) {
 
 function buildGeneratedPlaylistName(signatureTags: string[], audioVector: number[], seedKey: string): string {
   const pools = inferNamingPools(signatureTags, audioVector);
-  const seed = `${isoWeekKey()}:${seedKey}:${signatureTags.join("|")}:${audioVector.join("|")}:${pools.dominantFamily}`;
+  const seed = `${seedKey}:${signatureTags.join("|")}:${audioVector.join("|")}:${pools.dominantFamily}`;
   const random = seededRandom(hashSeed(seed));
   const adjective = pickWord(random, pools.adjectives, "Velvet");
   const texture = pickWord(random, pools.textures, "Smoke");
@@ -847,6 +848,38 @@ function buildGeneratedPlaylistName(signatureTags: string[], audioVector: number
     return compact.replace(/\s+/g, " ").trim();
   }
   return cleaned;
+}
+
+function buildMoodPlaylistName(moodName: string, signatureTags: string[], audioVector: number[], generationKey: string): string {
+  const seed = `${generationKey}:mood:${moodName}:${signatureTags.join("|")}:${audioVector.join("|")}`;
+  const random = seededRandom(hashSeed(seed));
+  const suffixes = ["Flow", "Current", "Pulse", "Arc", "Drift"];
+  const templates = [
+    `${moodName} ${pickWord(random, suffixes, "Flow")}`,
+    buildGeneratedPlaylistName(signatureTags, audioVector, `${generationKey}:mood-name:${moodName}`),
+    `${moodName} ${pickWord(random, ["Drive", "Tide", "Signal"], "Signal")}`
+  ];
+  return templates[Math.floor(random() * templates.length)] ?? `${moodName} Flow`;
+}
+
+function buildArtistPlaylistName(seedArtist: string, signatureTags: string[], audioVector: number[], generationKey: string): string {
+  const seed = `${generationKey}:artist:${seedArtist}:${signatureTags.join("|")}:${audioVector.join("|")}`;
+  const random = seededRandom(hashSeed(seed));
+  const suffix = pickWord(random, ["Constellation", "Orbit", "Signal", "Axis", "Halo"], "Constellation");
+  return `${seedArtist} ${suffix}`;
+}
+
+function buildDiscoveryPlaylistName(signatureTags: string[], audioVector: number[], generationKey: string): string {
+  const seed = `${generationKey}:discovery:${signatureTags.join("|")}:${audioVector.join("|")}`;
+  const random = seededRandom(hashSeed(seed));
+  const names = [
+    "Discovery Mix",
+    "Hidden Current",
+    "Offpath Pulse",
+    "Fresh Finds",
+    "Deep Discovery"
+  ];
+  return names[Math.floor(random() * names.length)] ?? "Discovery Mix";
 }
 
 function buildGeneratedPlaylistDescription(signatureTags: string[], audioVector: number[], source: PlaylistCandidate["source"]): string {
@@ -1612,12 +1645,14 @@ function selectDiverseCandidates(
   trackCount: number,
   artistByTrackId: Map<number, string>,
   primaryTagsByTrackId: Map<number, string[]>,
-  audioVectorByTrackId: Map<number, number[]>
+  audioVectorByTrackId: Map<number, number[]>,
+  generationKey: string
 ): PlaylistCandidate[] {
   const candidateProfiles = candidates.map((candidate) => {
     const artistSet = new Set(candidate.trackIds.map((trackId) => artistByTrackId.get(trackId) ?? `track-${trackId}`));
     const signatureTags = candidate.signatureTags.length ? candidate.signatureTags : topTagsFromTrackIds(candidate.trackIds, primaryTagsByTrackId, 8);
     const audioVector = candidate.audioVector.length ? candidate.audioVector : averageAudioVector(candidate.trackIds, audioVectorByTrackId);
+    const random = seededRandom(hashSeed(`${generationKey}:selection:${candidate.slug}:${candidate.name}`));
     const audioCoverage =
       candidate.trackIds.filter((trackId) => (audioVectorByTrackId.get(trackId) ?? []).length > 0).length / Math.max(candidate.trackIds.length, 1);
     const intrinsicScore =
@@ -1630,7 +1665,8 @@ function selectDiverseCandidates(
       artistSet,
       signatureTags,
       audioVector,
-      intrinsicScore
+      intrinsicScore,
+      selectionBias: (random() - 0.5) * 0.12
     };
   });
   const selected: typeof candidateProfiles = [];
@@ -1640,7 +1676,7 @@ function selectDiverseCandidates(
       .filter((entry) => !selected.includes(entry))
       .map((entry) => {
         if (!selected.length) {
-          return { entry, score: entry.intrinsicScore };
+          return { entry, score: entry.intrinsicScore + entry.selectionBias };
         }
         const similarities = selected.map((picked) => {
           const trackOverlap = jaccardScore(entry.candidate.trackIds, picked.candidate.trackIds);
@@ -1654,7 +1690,7 @@ function selectDiverseCandidates(
         const sourceBonus = usedSources.has(entry.candidate.source) ? 0 : 0.08;
         return {
           entry,
-          score: entry.intrinsicScore + sourceBonus - maxSimilarity * 0.85 - averageSimilarity * 0.3
+          score: entry.intrinsicScore + entry.selectionBias + sourceBonus - maxSimilarity * 0.85 - averageSimilarity * 0.3
         };
       })
       .sort((a, b) => b.score - a.score)[0];
@@ -1675,7 +1711,11 @@ function slugify(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
 
-async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists: number): Promise<PlaylistCandidate[]> {
+async function generateCandidates(
+  tracks: TrackRecord[],
+  desiredWeeklyPlaylists: number,
+  generationKey = isoWeekKey()
+): Promise<PlaylistCandidate[]> {
   const enriched = tracks.map((track) => ({
     ...track,
     tags: tagsFromTrack(track)
@@ -1750,10 +1790,10 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
     if (pooled.length < 16) {
       continue;
     }
-    const name = buildGeneratedPlaylistName(centroid, seedAudioVector, `cluster:${primaryTag}`);
+    const name = buildGeneratedPlaylistName(centroid, seedAudioVector, `${generationKey}:cluster:${primaryTag}`);
     candidates.push({
       name,
-      slug: slugify(name),
+      slug: `cluster-${slugify(primaryTag)}`,
       description: buildGeneratedPlaylistDescription(centroid, seedAudioVector, "cluster"),
       trackIds: pooled,
       source: "cluster",
@@ -1777,10 +1817,10 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       .slice(0, playlistPoolTargetSize * 2)
       .map((item) => item.id);
     const pooled = limitTracksByArtist(ranked, artistByTrackId, maxArtistPerPlaylist, 48, maxArtistFallbackPerPlaylist);
-    const name = `${moodName} Flow`;
+    const name = buildMoodPlaylistName(moodName, uniqueTags(moodTags), averageAudioVector(pooled, audioVectorByTrackId), generationKey);
     candidates.push({
       name,
-      slug: slugify(name),
+      slug: `mood-${slugify(moodName)}`,
       description: `${moodName} tracks ranked by tag similarity`,
       trackIds: pooled,
       source: "mood",
@@ -1815,15 +1855,16 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       .slice(0, playlistPoolTargetSize * 2)
       .map((item) => item.id);
     const pooled = limitTracksByArtist(similarTracks, artistByTrackId, maxArtistPerPlaylist, 54, maxArtistFallbackPerPlaylist);
-    const name = `${seedArtist} Constellation`;
+    const audioVector = averageAudioVector(pooled, audioVectorByTrackId);
+    const name = buildArtistPlaylistName(seedArtist, seedTags, audioVector, generationKey);
     candidates.push({
       name,
-      slug: slugify(name),
+      slug: `artist-${slugify(seedArtist)}`,
       description: `Artists and tracks sharing signature tags with ${seedArtist}`,
       trackIds: pooled,
       source: "artist",
       signatureTags: seedTags,
-      audioVector: averageAudioVector(pooled, audioVectorByTrackId)
+      audioVector
     });
   }
 
@@ -1858,14 +1899,15 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
       .slice(0, playlistPoolTargetSize * 2)
       .map((row) => row.id);
     const pooled = limitTracksByArtist(ranked, artistByTrackId, maxArtistPerPlaylist, 48, maxArtistFallbackPerPlaylist);
+    const audioVector = averageAudioVector(pooled, audioVectorByTrackId);
     candidates.push({
-      name: "Discovery Mix",
+      name: buildDiscoveryPlaylistName(favoriteTags.slice(0, 8), audioVector, generationKey),
       slug: "discovery-mix",
       description: "Least-played tracks with high overlap to favorites",
       trackIds: pooled,
       source: "discovery",
       signatureTags: favoriteTags.slice(0, 8),
-      audioVector: averageAudioVector(pooled, audioVectorByTrackId)
+      audioVector
     });
   }
 
@@ -1885,7 +1927,8 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
     limitedTrackCount,
     artistByTrackId,
     primaryTagsByTrackId,
-    audioVectorByTrackId
+    audioVectorByTrackId,
+    generationKey
   )
     .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
     .map((candidate, index) => ({
@@ -1894,8 +1937,16 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
     }));
 }
 
+function getRecommendedPlaylistNamesBySlug() {
+  const rows = db
+    .prepare("SELECT slug, name FROM playlists WHERE is_recommended = 1")
+    .all() as Array<{ slug: string; name: string }>;
+  return new Map(rows.map((row) => [row.slug, row.name]));
+}
+
 function replacePlaylists(candidates: PlaylistCandidate[]) {
   const now = new Date().toISOString();
+  previousRecommendedPlaylistNamesBySlug = getRecommendedPlaylistNamesBySlug();
   const transaction = db.transaction((list: PlaylistCandidate[]) => {
     markPlaylistsNotRecommendedStmt.run();
     for (const playlist of list) {
@@ -1958,6 +2009,7 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
   let applied = 0;
   let removed = 0;
   const weekKey = isoWeekKey();
+  const previousManagedNames = new Set(previousRecommendedPlaylistNamesBySlug.values());
   for (const playlist of managedPlaylists) {
     const trackRows = db
       .prepare(
@@ -1977,7 +2029,16 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
       .map((pathValue) => extractSubsonicSongId(pathValue))
       .filter((value): value is string => Boolean(value));
     const targetName = managedSubsonicPlaylistName(playlist);
+    const previousName = previousRecommendedPlaylistNamesBySlug.get(playlist.slug) ?? "";
     let remoteId = remoteByName.get(targetName) ?? "";
+    if (!remoteId && previousName) {
+      remoteId = remoteByName.get(previousName) ?? "";
+      if (remoteId && previousName !== targetName) {
+        await subsonicRequest(connection, "updatePlaylist.view", { playlistId: remoteId, name: targetName });
+        remoteByName.delete(previousName);
+        remoteByName.set(targetName, remoteId);
+      }
+    }
     if (!remoteId) {
       await subsonicRequest(connection, "createPlaylist.view", {
         name: targetName
@@ -2026,10 +2087,11 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
     applied += 1;
   }
   const managedNames = new Set(managedPlaylists.map((playlist) => managedSubsonicPlaylistName(playlist)));
+  const knownManagedNames = new Set([...managedNames, ...previousManagedNames]);
   for (const remote of remoteList.playlists?.playlist ?? []) {
     const isLegacyManagedPlaylist = remote.name.startsWith("Sortify - ");
-    const isCurrentManagedPlaylist = managedNames.has(remote.name);
-    if (!isLegacyManagedPlaylist && !isCurrentManagedPlaylist) {
+    const isKnownManagedPlaylist = knownManagedNames.has(remote.name);
+    if (!isLegacyManagedPlaylist && !isKnownManagedPlaylist) {
       continue;
     }
     if (managedNames.has(remote.name)) {
@@ -2038,15 +2100,19 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
     await subsonicRequest(connection, "deletePlaylist.view", { id: remote.id });
     removed += 1;
   }
+  previousRecommendedPlaylistNamesBySlug = new Map(managedPlaylists.map((playlist) => [playlist.slug, playlist.name]));
   return { applied, removed, total: managedPlaylists.length };
 }
 
-async function refreshRecommendedPlaylists(weeklyPlaylistCount = workerState.weeklyPlaylistCount) {
+async function refreshRecommendedPlaylists(
+  weeklyPlaylistCount = workerState.weeklyPlaylistCount,
+  generationKey = isoWeekKey()
+) {
   const tracks = db
     .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at FROM tracks")
     .all() as TrackRecord[];
   const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
-  const candidates = await generateCandidates(syncableTracks, weeklyPlaylistCount);
+  const candidates = await generateCandidates(syncableTracks, weeklyPlaylistCount, generationKey);
   replacePlaylists(candidates);
   appendLog({
     level: "info",
@@ -2473,7 +2539,7 @@ app.get("/api/scan/:id", (req, res) => {
 app.post("/api/playlists/generate", async (req, res) => {
   const requestedCount = Number(req.body?.weeklyPlaylistCount ?? workerState.weeklyPlaylistCount);
   const count = clamp(requestedCount, 1, 5);
-  const { candidates } = await refreshRecommendedPlaylists(count);
+  const { candidates } = await refreshRecommendedPlaylists(count, randomUUID());
   res.json({ generated: candidates.length, playlists: candidates.map((item) => ({ name: item.name, tracks: item.trackIds.length })) });
 });
 
