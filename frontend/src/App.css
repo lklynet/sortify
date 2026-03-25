@@ -602,6 +602,44 @@ button:disabled {
   gap: 1rem;
 }
 
+.playlistTopRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.playlistModeToggle {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.94rem;
+}
+
+.playlistModeIcon {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+.playlistModeToggle.dynamic {
+  color: var(--text-muted);
+}
+
+.playlistModeToggle.pinned {
+  color: #dbe7ff;
+  border-color: rgba(41, 121, 255, 0.4);
+  background: rgba(41, 121, 255, 0.12);
+}
+
+.playlistModeToggle.locked {
+  color: #ffe6b2;
+  border-color: rgba(181, 127, 36, 0.45);
+  background: rgba(181, 127, 36, 0.16);
+}
+
 .playlistList p {
   margin: 0.35rem 0 0.8rem;
   font-size: 0.83rem;
@@ -648,6 +686,10 @@ button:disabled {
   .trackHead {
     flex-direction: column;
     gap: 0.55rem;
+  }
+
+  .playlistTopRow {
+    flex-direction: column;
   }
 
   .brand-lockup {

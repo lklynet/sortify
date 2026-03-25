@@ -28,7 +28,7 @@ type PlaylistRecord = {
   slug: string;
   name: string;
   description: string | null;
-  mode: "live" | "frozen";
+  mode: "dynamic" | "pinned" | "locked";
   selected: number;
   sync_target: "subsonic";
   is_recommended: number;
@@ -325,6 +325,8 @@ if (!hasColumn("sync_target")) {
 if (!hasColumn("is_recommended")) {
   db.exec("ALTER TABLE playlists ADD COLUMN is_recommended INTEGER NOT NULL DEFAULT 1");
 }
+db.exec("UPDATE playlists SET mode = 'locked' WHERE mode = 'frozen'");
+db.exec("UPDATE playlists SET mode = 'dynamic' WHERE mode NOT IN ('dynamic', 'pinned', 'locked')");
 db.exec("UPDATE playlists SET sync_target = 'subsonic' WHERE sync_target = 'm3u'");
 db.exec("UPDATE playlists SET updated_at = CASE WHEN updated_at = '' THEN created_at ELSE updated_at END");
 
@@ -361,7 +363,7 @@ FROM tracks
 `);
 const deleteTrackByPathStmt = db.prepare("DELETE FROM tracks WHERE path = ?");
 
-const markPlaylistsNotRecommendedStmt = db.prepare("UPDATE playlists SET is_recommended = 0");
+const markPlaylistsNotRecommendedStmt = db.prepare("UPDATE playlists SET is_recommended = 0 WHERE mode = 'dynamic'");
 const findPlaylistBySlugStmt = db.prepare(
   "SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at FROM playlists WHERE slug = ?"
 );
@@ -375,6 +377,12 @@ SET name = @name,
     description = @description,
     updated_at = @updated_at,
     is_recommended = @is_recommended
+WHERE id = @id
+`);
+const refreshProtectedPlaylistStmt = db.prepare(`
+UPDATE playlists
+SET updated_at = @updated_at,
+    is_recommended = 1
 WHERE id = @id
 `);
 const deletePlaylistByIdStmt = db.prepare("DELETE FROM playlists WHERE id = ?");
@@ -1646,7 +1654,8 @@ function selectDiverseCandidates(
   artistByTrackId: Map<number, string>,
   primaryTagsByTrackId: Map<number, string[]>,
   audioVectorByTrackId: Map<number, number[]>,
-  generationKey: string
+  generationKey: string,
+  prioritizedSlugs = new Set<string>()
 ): PlaylistCandidate[] {
   const candidateProfiles = candidates.map((candidate) => {
     const artistSet = new Set(candidate.trackIds.map((trackId) => artistByTrackId.get(trackId) ?? `track-${trackId}`));
@@ -1671,9 +1680,12 @@ function selectDiverseCandidates(
   });
   const selected: typeof candidateProfiles = [];
   while (selected.length < playlistCount && selected.length < candidateProfiles.length) {
+    const preferredPool = candidateProfiles.filter(
+      (entry) => prioritizedSlugs.has(entry.candidate.slug) && !selected.includes(entry)
+    );
     const usedSources = new Set(selected.map((entry) => entry.candidate.source));
-    const next = candidateProfiles
-      .filter((entry) => !selected.includes(entry))
+    const selectionPool = preferredPool.length ? preferredPool : candidateProfiles.filter((entry) => !selected.includes(entry));
+    const next = selectionPool
       .map((entry) => {
         if (!selected.length) {
           return { entry, score: entry.intrinsicScore + entry.selectionBias };
@@ -1714,7 +1726,9 @@ function slugify(name: string): string {
 async function generateCandidates(
   tracks: TrackRecord[],
   desiredWeeklyPlaylists: number,
-  generationKey = isoWeekKey()
+  generationKey = isoWeekKey(),
+  pinnedSlugs = new Set<string>(),
+  lockedSlugs = new Set<string>()
 ): Promise<PlaylistCandidate[]> {
   const enriched = tracks.map((track) => ({
     ...track,
@@ -1911,7 +1925,7 @@ async function generateCandidates(
     });
   }
 
-  const limitedPlaylistCount = clamp(desiredWeeklyPlaylists, 1, 5);
+  const limitedPlaylistCount = clamp(desiredWeeklyPlaylists, 1, 5) + pinnedSlugs.size;
   const limitedTrackCount = clamp(settings.maxTracksPerPlaylist, 5, 100);
   const minimumTrackCount = Math.min(limitedTrackCount, 12);
   return selectDiverseCandidates(
@@ -1921,6 +1935,7 @@ async function generateCandidates(
         slug: candidate.slug || `weekly-${index + 1}`,
         trackIds: [...new Set(candidate.trackIds)].slice(0, playlistPoolTargetSize)
       }))
+      .filter((candidate) => !lockedSlugs.has(candidate.slug))
       .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
       .filter((candidate, index, list) => list.findIndex((entry) => entry.slug === candidate.slug) === index),
     limitedPlaylistCount,
@@ -1928,7 +1943,8 @@ async function generateCandidates(
     artistByTrackId,
     primaryTagsByTrackId,
     audioVectorByTrackId,
-    generationKey
+    generationKey,
+    pinnedSlugs
   )
     .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
     .map((candidate, index) => ({
@@ -1937,30 +1953,40 @@ async function generateCandidates(
     }));
 }
 
-function getRecommendedPlaylistNamesBySlug() {
+function getManagedPlaylistNamesBySlug() {
   const rows = db
-    .prepare("SELECT slug, name FROM playlists WHERE is_recommended = 1")
+    .prepare("SELECT slug, name FROM playlists WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')")
     .all() as Array<{ slug: string; name: string }>;
   return new Map(rows.map((row) => [row.slug, row.name]));
 }
 
 function replacePlaylists(candidates: PlaylistCandidate[]) {
   const now = new Date().toISOString();
-  previousRecommendedPlaylistNamesBySlug = getRecommendedPlaylistNamesBySlug();
+  previousRecommendedPlaylistNamesBySlug = getManagedPlaylistNamesBySlug();
   const transaction = db.transaction((list: PlaylistCandidate[]) => {
     markPlaylistsNotRecommendedStmt.run();
     for (const playlist of list) {
       const existing = findPlaylistBySlugStmt.get(playlist.slug) as PlaylistRecord | undefined;
       let playlistId = 0;
       if (existing) {
+        if (existing.mode === "locked") {
+          continue;
+        }
         playlistId = existing.id;
-        updatePlaylistMetadataStmt.run({
-          id: existing.id,
-          name: playlist.name,
-          description: playlist.description,
-          updated_at: now,
-          is_recommended: 1
-        });
+        if (existing.mode === "pinned") {
+          refreshProtectedPlaylistStmt.run({
+            id: existing.id,
+            updated_at: now
+          });
+        } else {
+          updatePlaylistMetadataStmt.run({
+            id: existing.id,
+            name: playlist.name,
+            description: playlist.description,
+            updated_at: now,
+            is_recommended: 1
+          });
+        }
       } else {
         const result = insertPlaylistStmt.run({
           slug: playlist.slug,
@@ -1968,7 +1994,7 @@ function replacePlaylists(candidates: PlaylistCandidate[]) {
           description: playlist.description,
           created_at: now,
           updated_at: now,
-          mode: "live",
+          mode: "dynamic",
           selected: 0,
           sync_target: "subsonic",
           is_recommended: 1
@@ -1981,7 +2007,7 @@ function replacePlaylists(candidates: PlaylistCandidate[]) {
       });
     }
     const stalePlaylists = db
-      .prepare("SELECT id FROM playlists WHERE is_recommended = 0 AND selected = 0")
+      .prepare("SELECT id FROM playlists WHERE is_recommended = 0 AND mode = 'dynamic' AND selected = 0")
       .all() as Array<{ id: number }>;
     for (const stale of stalePlaylists) {
       deletePlaylistByIdStmt.run(stale.id);
@@ -1996,7 +2022,12 @@ function managedSubsonicPlaylistName(playlist: PlaylistRecord): string {
 
 async function syncSubsonicPlaylists(connection: SubsonicConnection) {
   const managedPlaylists = db
-    .prepare("SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at FROM playlists WHERE is_recommended = 1 ORDER BY name")
+    .prepare(
+      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at
+       FROM playlists
+       WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')
+       ORDER BY CASE mode WHEN 'locked' THEN 0 WHEN 'pinned' THEN 1 ELSE 2 END, name`
+    )
     .all() as PlaylistRecord[];
   const remoteList = await subsonicRequest<{ playlists?: { playlist?: Array<{ id: string; name: string }> } }>(
     connection,
@@ -2019,7 +2050,10 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
          ORDER BY pt.position`
       )
       .all(playlist.id) as Array<{ trackId: number; path: string; artist: string | null }>;
-    const weeklyTrackIds = weeklyRotatedTrackIds(trackRows, `${playlist.slug}:${weekKey}`, clamp(settings.maxTracksPerPlaylist, 5, 100));
+    const weeklyTrackIds =
+      playlist.mode === "locked"
+        ? trackRows.map((row) => row.trackId)
+        : weeklyRotatedTrackIds(trackRows, `${playlist.slug}:${weekKey}`, clamp(settings.maxTracksPerPlaylist, 5, 100));
     const pathByTrackId = new Map<number, string>();
     for (const row of trackRows) {
       pathByTrackId.set(row.trackId, row.path);
@@ -2039,6 +2073,7 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
         remoteByName.set(targetName, remoteId);
       }
     }
+    const remoteAlreadyExisted = Boolean(remoteId);
     if (!remoteId) {
       await subsonicRequest(connection, "createPlaylist.view", {
         name: targetName
@@ -2062,6 +2097,10 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
         message: "Playlist created but remote id not found",
         meta: { name: targetName }
       });
+      continue;
+    }
+    if (playlist.mode === "locked" && remoteAlreadyExisted) {
+      applied += 1;
       continue;
     }
     const detail = await subsonicRequest<{ playlist?: { entry?: Array<{ id: string }> } }>(connection, "getPlaylist.view", {
@@ -2108,11 +2147,25 @@ async function refreshRecommendedPlaylists(
   weeklyPlaylistCount = workerState.weeklyPlaylistCount,
   generationKey = isoWeekKey()
 ) {
+  const pinnedSlugs = new Set(
+    (
+      db.prepare("SELECT slug FROM playlists WHERE mode = 'pinned'").all() as Array<{
+        slug: string;
+      }>
+    ).map((row) => row.slug)
+  );
+  const lockedSlugs = new Set(
+    (
+      db.prepare("SELECT slug FROM playlists WHERE mode = 'locked'").all() as Array<{
+        slug: string;
+      }>
+    ).map((row) => row.slug)
+  );
   const tracks = db
     .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at FROM tracks")
     .all() as TrackRecord[];
   const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
-  const candidates = await generateCandidates(syncableTracks, weeklyPlaylistCount, generationKey);
+  const candidates = await generateCandidates(syncableTracks, weeklyPlaylistCount, generationKey, pinnedSlugs, lockedSlugs);
   replacePlaylists(candidates);
   appendLog({
     level: "info",
@@ -2546,7 +2599,10 @@ app.post("/api/playlists/generate", async (req, res) => {
 app.get("/api/playlists", (_req, res) => {
   const playlists = db
     .prepare(
-      "SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at FROM playlists WHERE is_recommended = 1 ORDER BY name ASC"
+      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at
+       FROM playlists
+       WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')
+       ORDER BY CASE mode WHEN 'locked' THEN 0 WHEN 'pinned' THEN 1 ELSE 2 END, name ASC`
     )
     .all() as PlaylistRecord[];
   const response = playlists.map((playlist) => {
@@ -2574,8 +2630,17 @@ app.patch("/api/playlists/:id", async (req, res) => {
     return;
   }
   const existing = db
-    .prepare("SELECT id, mode, selected, sync_target FROM playlists WHERE id = ?")
-    .get(id) as { id: number; mode: "live" | "frozen"; selected: number; sync_target: "subsonic" } | undefined;
+    .prepare("SELECT id, slug, mode, selected, sync_target, is_recommended FROM playlists WHERE id = ?")
+    .get(id) as
+    | {
+        id: number;
+        slug: string;
+        mode: "dynamic" | "pinned" | "locked";
+        selected: number;
+        sync_target: "subsonic";
+        is_recommended: number;
+      }
+    | undefined;
   if (!existing) {
     res.status(404).json({ error: "Playlist not found" });
     return;
@@ -2584,21 +2649,17 @@ app.patch("/api/playlists/:id", async (req, res) => {
   const selectedInput = req.body?.selected;
   const syncTargetInput = req.body?.syncTarget;
   const selected = typeof selectedInput === "boolean" ? (selectedInput ? 1 : 0) : existing.selected;
-  let mode: "live" | "frozen" = modeInput === "frozen" ? "frozen" : modeInput === "live" ? "live" : existing.mode;
-  if (selected === 1) {
-    mode = "live";
-  }
+  const mode: "dynamic" | "pinned" | "locked" =
+    modeInput === "locked" || modeInput === "pinned" || modeInput === "dynamic" ? modeInput : existing.mode;
   const syncTarget: "subsonic" = syncTargetInput === "subsonic" || !syncTargetInput ? "subsonic" : existing.sync_target;
-  db.prepare("UPDATE playlists SET mode = ?, selected = ?, sync_target = ?, updated_at = ? WHERE id = ?").run(
+  db.prepare("UPDATE playlists SET mode = ?, selected = ?, sync_target = ?, is_recommended = ?, updated_at = ? WHERE id = ?").run(
     mode,
     selected,
     syncTarget,
+    mode === "dynamic" ? existing.is_recommended : 1,
     new Date().toISOString(),
     id
   );
-  if (existing.mode === "frozen" && mode === "live") {
-    await refreshRecommendedPlaylists();
-  }
   appendLog({
     level: "info",
     scope: "playlist",

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Lock, Pin, RefreshCw } from "lucide-react";
 import "./App.css";
 
 type Stats = { tracks: number; playlists: number; analyzedTracks: number };
@@ -28,6 +29,7 @@ type Playlist = {
   slug: string;
   name: string;
   description: string;
+  mode: "dynamic" | "pinned" | "locked";
   updated_at: string;
   tracks: Array<{ id: number; title: string; artist: string; album: string; path: string }>;
 };
@@ -94,6 +96,24 @@ function formatBpm(value: number | null) {
 
 function hasAudioAnalysis(track: Track) {
   return Boolean(track.audioFeatures && Array.isArray(track.audioFeatures.moodTags));
+}
+
+const playlistModeOptions = [
+  { value: "dynamic", label: "Weekly", Icon: RefreshCw, description: "Replaced by Sortify on refresh" },
+  { value: "pinned", label: "Pinned", Icon: Pin, description: "Stays in place and refreshes tracks" },
+  { value: "locked", label: "Locked", Icon: Lock, description: "Stays exactly as it is now" }
+] as const;
+
+function nextPlaylistMode(mode: Playlist["mode"]): Playlist["mode"] {
+  const currentIndex = playlistModeOptions.findIndex((option) => option.value === mode);
+  if (currentIndex < 0) {
+    return "dynamic";
+  }
+  return playlistModeOptions[(currentIndex + 1) % playlistModeOptions.length].value;
+}
+
+function playlistModeMeta(mode: Playlist["mode"]) {
+  return playlistModeOptions.find((option) => option.value === mode) ?? playlistModeOptions[0];
 }
 
 function App() {
@@ -281,6 +301,20 @@ function App() {
       await callApi("/api/playlists/generate", {
         method: "POST",
         body: JSON.stringify({ weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount })
+      });
+      if (hasSubsonicConnection) {
+        await callApi("/api/playlists/apply", {
+          method: "POST",
+          body: JSON.stringify(connectionPayload)
+        });
+      }
+    });
+
+  const updatePlaylistMode = (playlistId: number, mode: Playlist["mode"]) =>
+    runAction(`playlist-mode-${playlistId}-${mode}`, async () => {
+      await callApi(`/api/playlists/${playlistId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ mode })
       });
       if (hasSubsonicConnection) {
         await callApi("/api/playlists/apply", {
@@ -571,7 +605,9 @@ function App() {
 
         <article className="panel">
           <div className="panel-header panel-header-actions">
-            <h3>Current playlists</h3>
+            <div>
+              <h3>Current playlists</h3>
+            </div>
             <button
               className="ghost-button icon-button"
               onClick={() => openRefreshConfirmation("playlists")}
@@ -586,9 +622,31 @@ function App() {
             <ul className="playlistList">
               {playlists.map((playlist) => (
                 <li key={playlist.id}>
-                  <div className="playlistHead">
-                    <strong>{playlist.name}</strong>
-                    <span>{playlist.tracks.length} tracks</span>
+                  <div className="playlistTopRow">
+                    <div>
+                      <div className="playlistHead">
+                        <strong>{playlist.name}</strong>
+                        <span>{playlist.tracks.length} tracks</span>
+                      </div>
+                    </div>
+                    {(() => {
+                      const currentMode = playlistModeMeta(playlist.mode);
+                      const nextMode = nextPlaylistMode(playlist.mode);
+                      const nextModeInfo = playlistModeMeta(nextMode);
+                      const actionId = `playlist-mode-${playlist.id}-${nextMode}`;
+                      return (
+                        <button
+                          type="button"
+                          className={`ghost-button playlistModeToggle ${playlist.mode}`}
+                          onClick={() => updatePlaylistMode(playlist.id, nextMode)}
+                          disabled={busyAction !== null}
+                          aria-label={`${playlist.name} mode ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
+                          title={`Mode: ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
+                        >
+                          {busyAction === actionId ? "…" : <currentMode.Icon className="playlistModeIcon" aria-hidden="true" />}
+                        </button>
+                      );
+                    })()}
                   </div>
                   <p>{playlist.description}</p>
                   <div className="playlistTracks">
