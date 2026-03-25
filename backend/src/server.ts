@@ -21,6 +21,8 @@ type TrackRecord = {
   audio_vector_json: string;
   analysis_version: string | null;
   analysis_updated_at: string | null;
+  play_count: number;
+  favorite: number;
 };
 
 type PlaylistRecord = {
@@ -115,6 +117,24 @@ type AudioAnalysis = {
   rhythmicDensity: number;
   loudness: number;
   moodTags: string[];
+};
+
+type RankedTagSource = {
+  source: "base" | "musicbrainz-recording" | "musicbrainz-artist" | "lastfm-track" | "lastfm-artist" | "lastfm-album" | "audio";
+  weight: number;
+  tags: string[];
+};
+
+type LastFmTagResult = {
+  trackTags: string[];
+  artistTags: string[];
+  albumTags: string[];
+};
+
+type MusicBrainzTagResult = {
+  recordingTags: string[];
+  artistTags: string[];
+  year: number | null;
 };
 
 const envCandidates = [path.resolve(process.cwd(), ".env"), path.resolve(process.cwd(), "../.env")];
@@ -937,6 +957,59 @@ function uniqueTags(tags: string[]): string[] {
   )].slice(0, 40);
 }
 
+function mergeRankedTagSources(sources: RankedTagSource[], limit = 40): string[] {
+  const scoredTags = new Map<
+    string,
+    {
+      score: number;
+      sourceCount: number;
+      bestRank: number;
+      hasAudio: boolean;
+      hasExternalMetadata: boolean;
+      hasHeuristic: boolean;
+    }
+  >();
+  for (const source of sources) {
+    const tags = uniqueTags(source.tags);
+    tags.forEach((tag, index) => {
+      const entry = scoredTags.get(tag) ?? {
+        score: 0,
+        sourceCount: 0,
+        bestRank: Number.POSITIVE_INFINITY,
+        hasAudio: false,
+        hasExternalMetadata: false,
+        hasHeuristic: false
+      };
+      const rankWeight = Math.max(0.24, 1 - index * 0.08);
+      entry.score += source.weight * rankWeight * tagWeight(tag);
+      entry.sourceCount += 1;
+      entry.bestRank = Math.min(entry.bestRank, index);
+      if (source.source === "audio") {
+        entry.hasAudio = true;
+      } else if (source.source === "base") {
+        entry.hasHeuristic = true;
+      } else {
+        entry.hasExternalMetadata = true;
+      }
+      scoredTags.set(tag, entry);
+    });
+  }
+  return [...scoredTags.entries()]
+    .map(([tag, entry]) => ({
+      tag,
+      score:
+        entry.score +
+        Math.max(0, entry.sourceCount - 1) * 0.38 +
+        (entry.hasAudio && entry.hasExternalMetadata ? 0.18 : 0) +
+        (entry.hasHeuristic && entry.hasExternalMetadata ? 0.08 : 0),
+      bestRank: entry.bestRank,
+      sourceCount: entry.sourceCount
+    }))
+    .sort((a, b) => b.score - a.score || b.sourceCount - a.sourceCount || a.bestRank - b.bestRank || a.tag.localeCompare(b.tag))
+    .slice(0, limit)
+    .map((entry) => entry.tag);
+}
+
 function deriveBaseTags(
   title: string,
   artist: string,
@@ -1002,9 +1075,13 @@ async function fetchLastFmTopTags(params: URLSearchParams): Promise<string[]> {
   }
 }
 
-async function fetchLastFmTags(artist: string, title: string, album?: string | null): Promise<string[]> {
+async function fetchLastFmTags(artist: string, title: string, album?: string | null): Promise<LastFmTagResult> {
   if (!artist || !title) {
-    return [];
+    return {
+      trackTags: [],
+      artistTags: [],
+      albumTags: []
+    };
   }
   const normalizedArtist = normalizeTag(artist);
   const normalizedAlbum = album ? normalizeTag(album) : "";
@@ -1053,7 +1130,11 @@ async function fetchLastFmTags(artist: string, title: string, album?: string | n
   })();
 
   const [trackTags, artistTags, albumTags] = await Promise.all([trackTagsPromise, artistTagsPromise, albumTagsPromise]);
-  return uniqueTags([...trackTags, ...artistTags, ...albumTags]);
+  return {
+    trackTags,
+    artistTags,
+    albumTags
+  };
 }
 
 async function fetchMusicBrainzArtistTags(artistMbid: string): Promise<string[]> {
@@ -1094,9 +1175,9 @@ async function fetchMusicBrainzArtistTags(artistMbid: string): Promise<string[]>
   }
 }
 
-async function fetchMusicBrainzTags(artist: string, title: string): Promise<{ tags: string[]; year: number | null }> {
+async function fetchMusicBrainzTags(artist: string, title: string): Promise<MusicBrainzTagResult> {
   if (!artist || !title) {
-    return { tags: [], year: null };
+    return { recordingTags: [], artistTags: [], year: null };
   }
   const query = new URLSearchParams({
     query: `recording:"${title}" AND artist:"${artist}"`,
@@ -1113,7 +1194,7 @@ async function fetchMusicBrainzTags(artist: string, title: string): Promise<{ ta
       }
     });
     if (!response.ok) {
-      return { tags: [], year: null };
+      return { recordingTags: [], artistTags: [], year: null };
     }
     const payload = (await response.json()) as {
       recordings?: Array<{
@@ -1125,7 +1206,7 @@ async function fetchMusicBrainzTags(artist: string, title: string): Promise<{ ta
     };
     const recordings = payload.recordings ?? [];
     if (!recordings.length) {
-      return { tags: [], year: null };
+      return { recordingTags: [], artistTags: [], year: null };
     }
     const rankedRecordings = [...recordings].sort((a, b) => {
       const scoreA = typeof a.score === "number" ? a.score : Number.parseInt(String(a.score ?? "0"), 10);
@@ -1156,11 +1237,12 @@ async function fetchMusicBrainzTags(artist: string, title: string): Promise<{ ta
     const artistMbid = sample[0]?.["artist-credit"]?.[0]?.artist?.id ?? "";
     const artistTags = await fetchMusicBrainzArtistTags(artistMbid);
     return {
-      tags: uniqueTags([...recordingTags, ...artistTags]),
+      recordingTags,
+      artistTags,
       year: Number.isNaN(year) ? null : year
     };
   } catch {
-    return { tags: [], year: null };
+    return { recordingTags: [], artistTags: [], year: null };
   }
 }
 
@@ -1386,13 +1468,7 @@ async function scanLibrary(
     const duration = song.duration ?? null;
     const trackPath = `subsonic:${song.id}`;
     const existing = existingByPath.get(trackPath);
-    const existingTags = existing
-      ? tagsFromTrack({
-          ...existing,
-          id: 0,
-          path: trackPath
-        })
-      : [];
+    const existingTags = existing ? tagsFromTrack(existing) : [];
     const unchanged =
       existing &&
       (existing.title ?? "Unknown Title") === title &&
@@ -1431,7 +1507,15 @@ async function scanLibrary(
       const baseTags = deriveBaseTags(title, artist, mergedYear, song.genre ? [song.genre] : [], audioFeatures?.bpm ?? null);
       const lastFmTags = await fetchLastFmTags(artist, title, album);
       const audioTags = audioFeatures?.moodTags ?? [];
-      const tags = uniqueTags([...baseTags, ...musicBrainz.tags, ...lastFmTags, ...audioTags]);
+      const tags = mergeRankedTagSources([
+        { source: "base", weight: 0.42, tags: baseTags },
+        { source: "musicbrainz-recording", weight: 1, tags: musicBrainz.recordingTags },
+        { source: "musicbrainz-artist", weight: 0.78, tags: musicBrainz.artistTags },
+        { source: "lastfm-track", weight: 0.92, tags: lastFmTags.trackTags },
+        { source: "lastfm-album", weight: 0.76, tags: lastFmTags.albumTags },
+        { source: "lastfm-artist", weight: 0.68, tags: lastFmTags.artistTags },
+        { source: "audio", weight: 0.88, tags: audioTags }
+      ]);
       upsertTrackStmt.run({
         path: trackPath,
         title,
@@ -1494,7 +1578,7 @@ async function scanLibrary(
   return { scannedFiles: discovered.length, updatedTracks: updated, processedFiles: processed, errors, prunedTracks: pruned };
 }
 
-function tagsFromTrack(track: TrackRecord): string[] {
+function tagsFromTrack(track: Pick<TrackRecord, "tags_json">): string[] {
   try {
     const parsed = JSON.parse(track.tags_json) as string[];
     return Array.isArray(parsed) ? parsed : [];
@@ -1576,6 +1660,26 @@ function averageAudioVector(trackIds: number[], audioVectorByTrackId: Map<number
   return sums.map((value) => value / count);
 }
 
+function averageCentroidSimilarity(
+  trackIds: number[],
+  signatureTags: string[],
+  audioVector: number[],
+  primaryTagsByTrackId: Map<number, string[]>,
+  audioVectorByTrackId: Map<number, number[]>
+): number {
+  const sample = trackIds.slice(0, 18);
+  if (!sample.length) {
+    return 0;
+  }
+  let total = 0;
+  for (const trackId of sample) {
+    const tagSimilarity = signatureTags.length ? cosineScore(primaryTagsByTrackId.get(trackId) ?? [], signatureTags) : 0;
+    const audioSimilarity = audioVector.length ? cosineNumberScore(audioVectorByTrackId.get(trackId) ?? [], audioVector) : 0;
+    total += tagSimilarity * 0.7 + audioSimilarity * 0.3;
+  }
+  return total / sample.length;
+}
+
 function topTagsFromTrackIds(trackIds: number[], primaryTagsByTrackId: Map<number, string[]>, limit: number): string[] {
   const counts = new Map<string, number>();
   for (const trackId of trackIds) {
@@ -1647,6 +1751,79 @@ function selectPlaylistTracksForVariety(
   return selected;
 }
 
+function rerankTrackPoolForPlaylist(
+  trackIds: number[],
+  targetSize: number,
+  centroidTags: string[],
+  centroidAudioVector: number[],
+  trackTagsByTrackId: Map<number, string[]>,
+  audioVectorByTrackId: Map<number, number[]>,
+  artistByTrackId: Map<number, string>,
+  playCountByTrackId: Map<number, number>,
+  favoriteByTrackId: Map<number, boolean>,
+  maxPlayCount: number
+): number[] {
+  const uniqueTrackIds = [...new Set(trackIds)];
+  if (!uniqueTrackIds.length) {
+    return [];
+  }
+  const sourceRankByTrackId = new Map(uniqueTrackIds.map((trackId, index) => [trackId, index]));
+  const selected: number[] = [];
+  const selectedSet = new Set<number>();
+  const artistCounts = new Map<string, number>();
+  const passes = [maxArtistPerPlaylist, maxArtistFallbackPerPlaylist, Number.POSITIVE_INFINITY];
+  for (const maxPerArtist of passes) {
+    while (selected.length < targetSize) {
+      let bestTrackId: number | null = null;
+      let bestScore = Number.NEGATIVE_INFINITY;
+      for (const trackId of uniqueTrackIds) {
+        if (selectedSet.has(trackId)) {
+          continue;
+        }
+        const artist = artistByTrackId.get(trackId) ?? `track-${trackId}`;
+        const artistCount = artistCounts.get(artist) ?? 0;
+        if (artistCount >= maxPerArtist) {
+          continue;
+        }
+        const tags = trackTagsByTrackId.get(trackId) ?? [];
+        const audioVector = audioVectorByTrackId.get(trackId) ?? [];
+        const tagScore = centroidTags.length ? cosineScore(tags, centroidTags) : 0;
+        const audioScore = centroidAudioVector.length ? cosineNumberScore(audioVector, centroidAudioVector) : 0;
+        const playCount = playCountByTrackId.get(trackId) ?? 0;
+        const noveltyScore = maxPlayCount > 0 ? 1 - Math.log1p(playCount) / Math.log1p(maxPlayCount) : 0.5;
+        const favoriteBonus = favoriteByTrackId.get(trackId) ? 0.06 : 0;
+        const sourceRank = sourceRankByTrackId.get(trackId) ?? uniqueTrackIds.length - 1;
+        const sourceScore = uniqueTrackIds.length > 1 ? 1 - sourceRank / (uniqueTrackIds.length - 1) : 1;
+        const redundancyPenalty = selected.length
+          ? Math.max(
+              ...selected.map((selectedTrackId) => {
+                const selectedTags = trackTagsByTrackId.get(selectedTrackId) ?? [];
+                const selectedAudio = audioVectorByTrackId.get(selectedTrackId) ?? [];
+                return cosineScore(tags, selectedTags) * 0.72 + cosineNumberScore(audioVector, selectedAudio) * 0.28;
+              })
+            )
+          : 0;
+        const score = tagScore * 0.46 + audioScore * 0.24 + noveltyScore * 0.16 + sourceScore * 0.14 + favoriteBonus - redundancyPenalty * 0.18;
+        if (score > bestScore) {
+          bestScore = score;
+          bestTrackId = trackId;
+        }
+      }
+      if (bestTrackId === null) {
+        break;
+      }
+      selected.push(bestTrackId);
+      selectedSet.add(bestTrackId);
+      const artist = artistByTrackId.get(bestTrackId) ?? `track-${bestTrackId}`;
+      artistCounts.set(artist, (artistCounts.get(artist) ?? 0) + 1);
+    }
+    if (selected.length >= targetSize) {
+      break;
+    }
+  }
+  return selected;
+}
+
 function selectDiverseCandidates(
   candidates: PlaylistCandidate[],
   playlistCount: number,
@@ -1664,11 +1841,13 @@ function selectDiverseCandidates(
     const random = seededRandom(hashSeed(`${generationKey}:selection:${candidate.slug}:${candidate.name}`));
     const audioCoverage =
       candidate.trackIds.filter((trackId) => (audioVectorByTrackId.get(trackId) ?? []).length > 0).length / Math.max(candidate.trackIds.length, 1);
+    const cohesion = averageCentroidSimilarity(candidate.trackIds, signatureTags, audioVector, primaryTagsByTrackId, audioVectorByTrackId);
     const intrinsicScore =
-      Math.min(candidate.trackIds.length / Math.max(trackCount * 1.4, 1), 1) * 0.35 +
-      Math.min(signatureTags.length / 8, 1) * 0.25 +
-      Math.min(artistSet.size / Math.max(trackCount, 1), 1) * 0.2 +
-      audioCoverage * 0.2;
+      Math.min(candidate.trackIds.length / Math.max(trackCount * 1.4, 1), 1) * 0.28 +
+      Math.min(signatureTags.length / 8, 1) * 0.2 +
+      Math.min(artistSet.size / Math.max(trackCount, 1), 1) * 0.16 +
+      audioCoverage * 0.16 +
+      cohesion * 0.2;
     return {
       candidate,
       artistSet,
@@ -1737,13 +1916,20 @@ async function generateCandidates(
   const candidates: PlaylistCandidate[] = [];
   const artistByTrackId = new Map<number, string>();
   const primaryTagsByTrackId = new Map<number, string[]>();
+  const trackTagsByTrackId = new Map<number, string[]>();
   const audioVectorByTrackId = new Map<number, number[]>();
+  const playCountByTrackId = new Map<number, number>();
+  const favoriteByTrackId = new Map<number, boolean>();
+  const maxPlayCount = Math.max(...enriched.map((track) => Math.max(0, track.play_count ?? 0)), 0);
 
   for (const track of enriched) {
     artistByTrackId.set(track.id, track.artist ? normalizeTag(track.artist) : `track-${track.id}`);
+    trackTagsByTrackId.set(track.id, track.tags);
     const primaryTags = uniqueTags(track.tags.filter((tag) => isPrimaryClusterTag(tag))).slice(0, 10);
     primaryTagsByTrackId.set(track.id, primaryTags);
     audioVectorByTrackId.set(track.id, audioVectorFromTrack(track));
+    playCountByTrackId.set(track.id, Math.max(0, track.play_count ?? 0));
+    favoriteByTrackId.set(track.id, Boolean(track.favorite));
   }
 
   const tagHistogram = new Map<string, number>();
@@ -1795,7 +1981,18 @@ async function generateCandidates(
       .slice(0, playlistPoolTargetSize * 3)
       .map((item) => item.id);
     const pooled = limitTracksByArtist(
-      ranked,
+      rerankTrackPoolForPlaylist(
+        ranked,
+        clamp(settings.maxTracksPerPlaylist * 2, 24, playlistPoolTargetSize),
+        centroid,
+        seedAudioVector,
+        trackTagsByTrackId,
+        audioVectorByTrackId,
+        artistByTrackId,
+        playCountByTrackId,
+        favoriteByTrackId,
+        maxPlayCount
+      ),
       artistByTrackId,
       maxArtistPerPlaylist,
       clamp(settings.maxTracksPerPlaylist * 2, 24, playlistPoolTargetSize),
@@ -1822,15 +2019,30 @@ async function generateCandidates(
       continue;
     }
     const centroid = uniqueTags(seed.flatMap((track) => track.tags));
+    const moodAudioVector = averageAudioVector(
+      seed.map((track) => track.id),
+      audioVectorByTrackId
+    );
     const ranked = [...enriched]
       .map((track) => ({
         id: track.id,
-        score: cosineScore(track.tags, centroid)
+        score: cosineScore(track.tags, centroid) * 0.76 + cosineNumberScore(audioVectorByTrackId.get(track.id) ?? [], moodAudioVector) * 0.24
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, playlistPoolTargetSize * 2)
       .map((item) => item.id);
-    const pooled = limitTracksByArtist(ranked, artistByTrackId, maxArtistPerPlaylist, 48, maxArtistFallbackPerPlaylist);
+    const pooled = rerankTrackPoolForPlaylist(
+      ranked,
+      48,
+      uniqueTags(moodTags),
+      moodAudioVector,
+      trackTagsByTrackId,
+      audioVectorByTrackId,
+      artistByTrackId,
+      playCountByTrackId,
+      favoriteByTrackId,
+      maxPlayCount
+    );
     const name = buildMoodPlaylistName(moodName, uniqueTags(moodTags), averageAudioVector(pooled, audioVectorByTrackId), generationKey);
     candidates.push({
       name,
@@ -1860,15 +2072,29 @@ async function generateCandidates(
     .slice(0, 4);
   for (const [seedArtist, seedData] of artistSeeds) {
     const seedTags = uniqueTags(seedData.tags.filter((tag) => isPrimaryClusterTag(tag)));
+    const seedAudioVector = averageAudioVector(seedData.ids, audioVectorByTrackId);
     const similarTracks = [...enriched]
       .map((track) => ({
         id: track.id,
-        score: cosineScore(primaryTagsByTrackId.get(track.id) ?? track.tags, seedTags)
+        score:
+          cosineScore(primaryTagsByTrackId.get(track.id) ?? track.tags, seedTags) * 0.78 +
+          cosineNumberScore(audioVectorByTrackId.get(track.id) ?? [], seedAudioVector) * 0.22
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, playlistPoolTargetSize * 2)
       .map((item) => item.id);
-    const pooled = limitTracksByArtist(similarTracks, artistByTrackId, maxArtistPerPlaylist, 54, maxArtistFallbackPerPlaylist);
+    const pooled = rerankTrackPoolForPlaylist(
+      similarTracks,
+      54,
+      seedTags,
+      seedAudioVector,
+      trackTagsByTrackId,
+      audioVectorByTrackId,
+      artistByTrackId,
+      playCountByTrackId,
+      favoriteByTrackId,
+      maxPlayCount
+    );
     const audioVector = averageAudioVector(pooled, audioVectorByTrackId);
     const name = buildArtistPlaylistName(seedArtist, seedTags, audioVector, generationKey);
     candidates.push({
@@ -1883,12 +2109,12 @@ async function generateCandidates(
   }
 
   const leastPlayed = db
-    .prepare("SELECT id, tags_json FROM tracks ORDER BY play_count ASC, RANDOM() LIMIT 120")
-    .all() as Array<{ id: number; tags_json: string }>;
+    .prepare("SELECT id, tags_json, audio_vector_json, play_count FROM tracks ORDER BY play_count ASC, RANDOM() LIMIT 160")
+    .all() as Array<{ id: number; tags_json: string; audio_vector_json: string; play_count: number }>;
   if (leastPlayed.length > 24) {
     const favoriteTagsRows = db
-      .prepare("SELECT tags_json FROM tracks WHERE favorite = 1 ORDER BY play_count DESC LIMIT 30")
-      .all() as Array<{ tags_json: string }>;
+      .prepare("SELECT id, tags_json FROM tracks WHERE favorite = 1 ORDER BY play_count DESC LIMIT 30")
+      .all() as Array<{ id: number; tags_json: string }>;
     const favoriteTags = uniqueTags(
       favoriteTagsRows.flatMap((row) => {
         try {
@@ -1897,6 +2123,10 @@ async function generateCandidates(
           return [];
         }
       })
+    );
+    const favoriteAudioVector = averageAudioVector(
+      favoriteTagsRows.map((row) => row.id),
+      audioVectorByTrackId
     );
     const ranked = leastPlayed
       .map((row) => {
@@ -1907,12 +2137,28 @@ async function generateCandidates(
             return [];
           }
         })();
-        return { id: row.id, score: cosineScore(tags, favoriteTags) };
+        const audioVector = audioVectorFromTrack(row);
+        const noveltyScore = maxPlayCount > 0 ? 1 - Math.log1p(Math.max(0, row.play_count)) / Math.log1p(maxPlayCount) : 0.5;
+        return {
+          id: row.id,
+          score: cosineScore(tags, favoriteTags) * 0.68 + cosineNumberScore(audioVector, favoriteAudioVector) * 0.2 + noveltyScore * 0.12
+        };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, playlistPoolTargetSize * 2)
       .map((row) => row.id);
-    const pooled = limitTracksByArtist(ranked, artistByTrackId, maxArtistPerPlaylist, 48, maxArtistFallbackPerPlaylist);
+    const pooled = rerankTrackPoolForPlaylist(
+      ranked,
+      48,
+      favoriteTags.slice(0, 10),
+      favoriteAudioVector,
+      trackTagsByTrackId,
+      audioVectorByTrackId,
+      artistByTrackId,
+      playCountByTrackId,
+      favoriteByTrackId,
+      maxPlayCount
+    );
     const audioVector = averageAudioVector(pooled, audioVectorByTrackId);
     candidates.push({
       name: buildDiscoveryPlaylistName(favoriteTags.slice(0, 8), audioVector, generationKey),
@@ -2162,7 +2408,9 @@ async function refreshRecommendedPlaylists(
     ).map((row) => row.slug)
   );
   const tracks = db
-    .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at FROM tracks")
+    .prepare(
+      "SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at, play_count, favorite FROM tracks"
+    )
     .all() as TrackRecord[];
   const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
   const candidates = await generateCandidates(syncableTracks, weeklyPlaylistCount, generationKey, pinnedSlugs, lockedSlugs);
