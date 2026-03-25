@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Lock, Pin, RefreshCw } from "lucide-react";
 import "./App.css";
 
@@ -148,6 +148,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [toastEntry, setToastEntry] = useState<OperationLog | null>(null);
   const [confirmRefreshModal, setConfirmRefreshModal] = useState<ConfirmRefreshModal>(null);
+  const playlistReorderOnNextLoadRef = useRef(true);
 
   const hasNavidromePassword = Boolean(settingsDraft.navidromePassword.trim() || settingsDraft.hasNavidromePassword);
   const hasSubsonicConnection = Boolean(
@@ -206,7 +207,19 @@ function App() {
     ]);
     setStats(fetchedStats);
     setTracks(fetchedTracks);
-    setPlaylists(fetchedPlaylists);
+    setPlaylists((currentPlaylists) => {
+      if (playlistReorderOnNextLoadRef.current || !currentPlaylists.length) {
+        playlistReorderOnNextLoadRef.current = false;
+        return fetchedPlaylists;
+      }
+      const fetchedById = new Map(fetchedPlaylists.map((playlist) => [playlist.id, playlist]));
+      const preservedOrder = currentPlaylists
+        .map((playlist) => fetchedById.get(playlist.id))
+        .filter((playlist): playlist is Playlist => Boolean(playlist));
+      const existingIds = new Set(currentPlaylists.map((playlist) => playlist.id));
+      const appended = fetchedPlaylists.filter((playlist) => !existingIds.has(playlist.id));
+      return [...preservedOrder, ...appended];
+    });
     setWorker(fetchedWorker);
     setSettings(fetchedSettings);
     if (!settingsOpen || !settingsDirty) {
@@ -308,6 +321,7 @@ function App() {
           body: JSON.stringify(connectionPayload)
         });
       }
+      playlistReorderOnNextLoadRef.current = true;
     });
 
   const updatePlaylistMode = (playlistId: number, mode: Playlist["mode"]) =>
@@ -316,12 +330,6 @@ function App() {
         method: "PATCH",
         body: JSON.stringify({ mode })
       });
-      if (hasSubsonicConnection) {
-        await callApi("/api/playlists/apply", {
-          method: "POST",
-          body: JSON.stringify(connectionPayload)
-        });
-      }
     });
 
   const openRefreshConfirmation = (action: "analysis" | "playlists") => {

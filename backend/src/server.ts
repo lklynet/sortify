@@ -2660,10 +2660,11 @@ app.patch("/api/playlists/:id", async (req, res) => {
     new Date().toISOString(),
     id
   );
+  const modeLabel = mode === "dynamic" ? "weekly" : mode;
   appendLog({
     level: "info",
     scope: "playlist",
-    message: "Playlist settings updated",
+    message: `Playlist set to ${modeLabel}`,
     meta: { id, mode, selected, syncTarget }
   });
   res.json({ ok: true });
