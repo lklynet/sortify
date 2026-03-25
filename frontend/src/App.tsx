@@ -58,9 +58,6 @@ type Settings = {
   hasNavidromePassword: boolean;
   lastFmApiKey: string;
   hasLastFmApiKey: boolean;
-  geminiApiKey: string;
-  hasGeminiApiKey: boolean;
-  geminiModel: string;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
 };
@@ -100,9 +97,6 @@ function App() {
     hasNavidromePassword: false,
     lastFmApiKey: "",
     hasLastFmApiKey: false,
-    geminiApiKey: "",
-    hasGeminiApiKey: false,
-    geminiModel: "models/gemini-flash-lite-latest",
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
   });
@@ -113,9 +107,6 @@ function App() {
     hasNavidromePassword: false,
     lastFmApiKey: "",
     hasLastFmApiKey: false,
-    geminiApiKey: "",
-    hasGeminiApiKey: false,
-    geminiModel: "models/gemini-flash-lite-latest",
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
   });
@@ -133,14 +124,12 @@ function App() {
   const hasSubsonicConnection = Boolean(
     settingsDraft.navidromeUrl.trim() && settingsDraft.navidromeUsername.trim() && hasNavidromePassword
   );
-  const hasGemini = Boolean(settingsDraft.geminiApiKey.trim() || settingsDraft.hasGeminiApiKey);
-  const startReady = hasSubsonicConnection && hasGemini;
+  const startReady = hasSubsonicConnection;
   const keyStatus = useMemo(
     () => ({
-      lastfm: Boolean(settingsDraft.lastFmApiKey.trim() || settingsDraft.hasLastFmApiKey),
-      gemini: Boolean(settingsDraft.geminiApiKey.trim() || settingsDraft.hasGeminiApiKey)
+      lastfm: Boolean(settingsDraft.lastFmApiKey.trim() || settingsDraft.hasLastFmApiKey)
     }),
-    [settingsDraft.geminiApiKey, settingsDraft.hasGeminiApiKey, settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
+    [settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
   );
   const recentAnalyzedTracks = useMemo(() => tracks.filter((track) => hasAudioAnalysis(track)).length, [tracks]);
   const mergeSettingsDraft = useCallback(
@@ -148,10 +137,8 @@ function App() {
       ...nextSettings,
       navidromePassword: currentDraft.navidromePassword,
       lastFmApiKey: currentDraft.lastFmApiKey,
-      geminiApiKey: currentDraft.geminiApiKey,
       hasNavidromePassword: nextSettings.hasNavidromePassword || currentDraft.navidromePassword.trim().length > 0,
-      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0,
-      hasGeminiApiKey: nextSettings.hasGeminiApiKey || currentDraft.geminiApiKey.trim().length > 0
+      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0
     }),
     []
   );
@@ -159,7 +146,6 @@ function App() {
     const nextSettings: Record<string, string | number> = {
       navidromeUrl: settingsDraft.navidromeUrl.trim(),
       navidromeUsername: settingsDraft.navidromeUsername.trim(),
-      geminiModel: settingsDraft.geminiModel.trim().replace(/^models\//, ""),
       weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount,
       maxTracksPerPlaylist: settingsDraft.maxTracksPerPlaylist
     };
@@ -168,9 +154,6 @@ function App() {
     }
     if (settingsDraft.lastFmApiKey.trim()) {
       nextSettings.lastFmApiKey = settingsDraft.lastFmApiKey.trim();
-    }
-    if (settingsDraft.geminiApiKey.trim()) {
-      nextSettings.geminiApiKey = settingsDraft.geminiApiKey.trim();
     }
     return nextSettings;
   }, [settingsDraft]);
@@ -376,31 +359,6 @@ function App() {
                       placeholder={settingsDraft.hasLastFmApiKey ? "****************" : "enter Last.fm key"}
                     />
                   </div>
-                  <div className="field">
-                    <label htmlFor="geminiApiKey">Gemini API Key</label>
-                    <input
-                      id="geminiApiKey"
-                      type="password"
-                      value={settingsDraft.geminiApiKey}
-                      onChange={(event) => {
-                        setSettingsDraft((prev) => ({ ...prev, geminiApiKey: event.target.value }));
-                        setSettingsDirty(true);
-                      }}
-                      placeholder={settingsDraft.hasGeminiApiKey ? "****************" : "enter Gemini key"}
-                    />
-                  </div>
-                  <div className="field">
-                    <label htmlFor="geminiModel">Gemini Model</label>
-                    <input
-                      id="geminiModel"
-                      value={settingsDraft.geminiModel}
-                      onChange={(event) => {
-                        setSettingsDraft((prev) => ({ ...prev, geminiModel: event.target.value.replace(/^models\//, "") }));
-                        setSettingsDirty(true);
-                      }}
-                      placeholder="gemini-flash-lite-latest"
-                    />
-                  </div>
                 </div>
               </section>
 
@@ -471,7 +429,6 @@ function App() {
           </div>
           <div className="signal-row">
             <span className={`signal ${hasSubsonicConnection ? "ok" : "bad"}`}>Navidrome {hasSubsonicConnection ? "Ready" : "Missing"}</span>
-            <span className={`signal ${keyStatus.gemini ? "ok" : "bad"}`}>Gemini {keyStatus.gemini ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.lastfm ? "ok" : "warn"}`}>Last.fm {keyStatus.lastfm ? "Ready" : "Optional"}</span>
             <span className={`signal ${stats.analyzedTracks ? "ok" : "warn"}`}>Analyzed {stats.analyzedTracks}/{stats.tracks}</span>
             <span className="signal neutral">Playlists/Week {settings.weeklyPlaylistCount}</span>

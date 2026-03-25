@@ -4,7 +4,7 @@
 
 # Sortify
 
-It's is a self-hosted playlist assistant for Navidrome. It scans your library, stores metadata locally, and generates AI-recommended playlists from the web UI. It does NOT touch your files metadata and instead stores it in a local SQLite database, keeping your files safe and untouched.
+It's is a self-hosted playlist assistant for Navidrome. It scans your library, stores metadata locally, and generates recommended playlists from the web UI. It does NOT touch your files metadata and instead stores it in a local SQLite database, keeping your files safe and untouched.
 
 ## Screenshot
 
@@ -14,7 +14,6 @@ It's is a self-hosted playlist assistant for Navidrome. It scans your library, s
 
 - Navidrome
 - Last.FM API key
-- Gemini API key
 
 ## Docker build
 
@@ -40,8 +39,6 @@ All settings can be updated via the app UI. It supports these environment variab
 - `SUBSONIC_USER`
 - `SUBSONIC_PASSWORD`
 - `LASTFM_API_KEY`
-- `GEMINI_API_KEY`
-- `GEMINI_MODEL`
 - `MAX_TRACKS_PER_PLAYLIST`
 
 ## License

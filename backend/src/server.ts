@@ -40,18 +40,9 @@ type PlaylistCandidate = {
   slug: string;
   description: string;
   trackIds: number[];
-  source: "ai" | "mood" | "artist" | "discovery";
+  source: "cluster" | "mood" | "artist" | "discovery";
   signatureTags: string[];
   audioVector: number[];
-};
-
-type AiPlaylistPlan = {
-  name: string;
-  description: string;
-  focusTags: string[];
-  avoidTags: string[];
-  targetSize: number;
-  maxPerArtist: number;
 };
 
 type ScanProgress = {
@@ -82,8 +73,6 @@ type AppSettings = {
   navidromeUsername: string;
   navidromePassword: string;
   lastFmApiKey: string;
-  geminiApiKey: string;
-  geminiModel: string;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
 };
@@ -149,8 +138,6 @@ const defaultSubsonicUrl = process.env.SUBSONIC_URL ?? "";
 const defaultSubsonicUser = process.env.SUBSONIC_USER ?? "";
 const defaultSubsonicPassword = process.env.SUBSONIC_PASSWORD ?? "";
 const defaultLastFmApiKey = process.env.LASTFM_API_KEY ?? "";
-const defaultGeminiApiKey = process.env.GEMINI_API_KEY ?? "";
-const defaultGeminiModel = process.env.GEMINI_MODEL ?? "gemini-flash-lite-latest";
 const defaultMaxTracksPerPlaylist = Math.max(5, Math.min(100, Number(process.env.MAX_TRACKS_PER_PLAYLIST ?? 20)));
 const settingsKeyFile = process.env.SORTIFY_SETTINGS_KEY_FILE ?? path.resolve(path.dirname(dbFile), ".sortify-settings.key");
 const audioAnalysisScriptFile = path.resolve(serverDir, "../scripts/analyze_track.py");
@@ -179,8 +166,6 @@ const settings: AppSettings = {
   navidromeUsername: defaultSubsonicUser,
   navidromePassword: defaultSubsonicPassword,
   lastFmApiKey: defaultLastFmApiKey,
-  geminiApiKey: defaultGeminiApiKey,
-  geminiModel: defaultGeminiModel,
   weeklyPlaylistCount: 3,
   maxTracksPerPlaylist: defaultMaxTracksPerPlaylist
 };
@@ -195,11 +180,6 @@ function appendLog(entry: Omit<OperationLogEntry, "id" | "timestamp">) {
   if (operationLogs.length > 800) {
     operationLogs.shift();
   }
-}
-
-function normalizeGeminiModel(value: string): string {
-  const normalized = value.trim().replace(/^models\//, "");
-  return normalized || defaultGeminiModel;
 }
 
 function getSettingsEncryptionKey() {
@@ -427,13 +407,6 @@ function loadPersistedSettings() {
     settings.lastFmApiKey = decrypted.value;
     secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
   }
-  const persistedGeminiApiKey = read("geminiApiKey");
-  if (persistedGeminiApiKey !== undefined) {
-    const decrypted = decryptSettingValue(persistedGeminiApiKey);
-    settings.geminiApiKey = decrypted.value;
-    secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
-  }
-  settings.geminiModel = normalizeGeminiModel(read("geminiModel") ?? settings.geminiModel);
   const weekly = Number.parseInt(read("weeklyPlaylistCount") ?? "", 10);
   if (!Number.isNaN(weekly)) {
     settings.weeklyPlaylistCount = clamp(weekly, 1, 5);
@@ -461,8 +434,6 @@ function persistSettings() {
     upsertSettingStmt.run("navidromeUsername", settings.navidromeUsername);
     upsertSettingStmt.run("navidromePassword", encryptSettingValue(settings.navidromePassword));
     upsertSettingStmt.run("lastFmApiKey", encryptSettingValue(settings.lastFmApiKey));
-    upsertSettingStmt.run("geminiApiKey", encryptSettingValue(settings.geminiApiKey));
-    upsertSettingStmt.run("geminiModel", settings.geminiModel);
     upsertSettingStmt.run("weeklyPlaylistCount", String(settings.weeklyPlaylistCount));
     upsertSettingStmt.run("maxTracksPerPlaylist", String(settings.maxTracksPerPlaylist));
     upsertSettingStmt.run("workerRunning", String(workerState.running));
@@ -713,200 +684,192 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function sanitizeAiPlaylistPlan(input: unknown): AiPlaylistPlan | null {
-  if (!input || typeof input !== "object") {
-    return null;
+const namingFamilies = [
+  {
+    id: "nocturnal",
+    match: ["ambient", "dark", "night", "nocturne", "dream", "slowcore", "shoegaze", "trip-hop"],
+    adjectives: ["Nocturnal", "Moonlit", "Dusky", "Shadow", "Midnight", "Lowlight", "Afterhours", "Hushed"],
+    textures: ["Velvet", "Smoke", "Ash", "Static", "Obsidian", "Glass", "Mist", "Echo"],
+    nouns: ["Drift", "Signal", "Tide", "Afterglow", "Horizon", "Current", "Ritual", "Orbit"]
+  },
+  {
+    id: "kinetic",
+    match: ["dance", "house", "edm", "electronic", "techno", "drum & bass", "jungle", "club"],
+    adjectives: ["Kinetic", "Electric", "Neon", "Rapid", "Bright", "Restless", "Fever", "Infrared"],
+    textures: ["Chrome", "Circuit", "Laser", "Static", "Voltage", "Digital", "Strobe", "Mirror"],
+    nouns: ["Pulse", "Rush", "Ignition", "Motion", "Surge", "Orbit", "Drive", "Frequency"]
+  },
+  {
+    id: "organic",
+    match: ["acoustic", "folk", "americana", "country", "organic", "singer-songwriter", "bluegrass"],
+    adjectives: ["Golden", "Earthbound", "Open", "Dusty", "Warm", "Sunworn", "Woodland", "Plainspoken"],
+    textures: ["Amber", "Cedar", "Canvas", "Meadow", "Lantern", "Soil", "Prairie", "Oak"],
+    nouns: ["Trails", "Fields", "Breeze", "Valley", "Harbor", "Campfire", "Meadow", "Path"]
+  },
+  {
+    id: "heavy",
+    match: ["metal", "doom", "sludge", "hardcore", "punk", "industrial", "noise", "grindcore"],
+    adjectives: ["Iron", "Feral", "Crimson", "Blackened", "Shattered", "Savage", "Burning", "Rusted"],
+    textures: ["Steel", "Ash", "Soot", "Concrete", "Furnace", "Ember", "Granite", "Smoke"],
+    nouns: ["Collapse", "Ritual", "Pressure", "Strike", "Surge", "Faultline", "March", "Voltage"]
+  },
+  {
+    id: "lush",
+    match: ["soul", "r&b", "funk", "disco", "jazz", "groove", "boogie", "swing"],
+    adjectives: ["Velvet", "Satin", "Late", "Honeyed", "Luminous", "Slowburn", "Silken", "Golden"],
+    textures: ["Mirage", "Rouge", "Smoke", "Velour", "Brass", "Lace", "Neon", "Ivory"],
+    nouns: ["Groove", "Parade", "Current", "Room", "Afterglow", "Boulevard", "Shimmer", "Pulse"]
+  },
+  {
+    id: "cinematic",
+    match: ["classical", "orchestral", "cinematic", "post-rock", "soundtrack", "instrumental", "ambient"],
+    adjectives: ["Luminous", "Vast", "Radiant", "Silver", "Weightless", "Quiet", "Endless", "Celestial"],
+    textures: ["Halo", "Glass", "Ivory", "Marble", "Mist", "Skyline", "Aurora", "Prism"],
+    nouns: ["Nocturne", "Passage", "Horizon", "Arc", "Sky", "Afterglow", "Bloom", "Overture"]
   }
-  const value = input as Record<string, unknown>;
-  const name = String(value.name ?? "").trim();
-  const description = String(value.description ?? "").trim();
-  const focusTagsRaw = Array.isArray(value.focusTags) ? value.focusTags : [];
-  const avoidTagsRaw = Array.isArray(value.avoidTags) ? value.avoidTags : [];
-  const focusTags = uniqueTags(focusTagsRaw.map((item) => String(item ?? "")).filter(Boolean)).filter((tag) => isPrimaryClusterTag(tag)).slice(0, 8);
-  const avoidTags = uniqueTags(avoidTagsRaw.map((item) => String(item ?? "")).filter(Boolean)).slice(0, 8);
-  const targetSize = clamp(Number(value.targetSize ?? settings.maxTracksPerPlaylist * 2), 12, playlistPoolTargetSize);
-  const maxPerArtist = clamp(Number(value.maxPerArtist ?? maxArtistPerPlaylist), 1, 4);
-  if (!name || !description || focusTags.length < 2) {
-    return null;
-  }
-  return { name, description, focusTags, avoidTags, targetSize, maxPerArtist };
+] as const;
+
+const namingFallback = {
+  adjectives: ["Velvet", "Silver", "Tender", "Restless", "Radiant", "Faded", "Wild", "Quiet", "Golden", "Midnight"],
+  textures: ["Smoke", "Chrome", "Amber", "Glass", "Ash", "Static", "Cedar", "Halo", "Velour", "Mirror"],
+  nouns: ["Drift", "Pulse", "Tide", "Orbit", "Bloom", "Signal", "Current", "Afterglow", "Ritual", "Horizon"]
+};
+
+const lowValueNameTags = new Set([
+  "high energy",
+  "low tempo",
+  "mid tempo",
+  "decade",
+  "favorites",
+  "favorite",
+  "favorite tracks",
+  "songs",
+  "tracks",
+  "music",
+  "artist"
+]);
+
+function titleCaseWords(value: string): string {
+  return value
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
-async function fetchGeminiPlaylistPlans(tracks: Array<{ title: string; artist: string; year: number | null; tags: string[] }>): Promise<AiPlaylistPlan[]> {
-  if (!settings.geminiApiKey) {
-    return [];
-  }
-  const sampled = tracks.slice(0, 140).map((track) => ({
-    title: track.title,
-    artist: track.artist,
-    year: track.year,
-    tags: track.tags.slice(0, 8)
-  }));
-  const tagHistogram = new Map<string, number>();
-  for (const track of sampled) {
-    for (const tag of track.tags) {
-      if (!isPrimaryClusterTag(tag)) {
-        continue;
-      }
-      tagHistogram.set(tag, (tagHistogram.get(tag) ?? 0) + 1);
-    }
-  }
-  const topTags = [...tagHistogram.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 36)
-    .map(([tag, count]) => ({ tag, count }));
+function uniqueWordPool(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
 
-  const prompt = JSON.stringify(
-    {
-      task: "Create low-cost weekly music playlist plans from track tags",
-      constraints: {
-        count: 8,
-        targetSizeRange: [36, 72],
-        maxPerArtistRange: [1, 2],
-        requireMultiTagOverlap: true,
-        avoidYearCentricGrouping: true,
-        requireDistinctPlans: true,
-        preferDifferentGenreMoodCenters: true,
-        maxSharedFocusTagsBetweenPlans: 2,
-        namingStyle:
-          "Use evocative, emotionally descriptive names grounded in the actual musical vibe and tags. Avoid plain genre-only names and avoid random nonsense."
-      },
-      output: {
-        format: "json",
-        schema: {
-          plans: [{ name: "string", description: "string", focusTags: ["string"], avoidTags: ["string"], targetSize: "number", maxPerArtist: "number" }]
-        }
-      },
-      topTags,
-      sampleTracks: sampled
-    },
-    null,
-    2
+function pickWord(random: () => number, values: string[], fallback: string) {
+  return values[Math.floor(random() * values.length)] ?? fallback;
+}
+
+function inferNamingPools(signatureTags: string[], audioVector: number[]) {
+  const matchingFamilies = namingFamilies
+    .map((family) => ({
+      family,
+      score: family.match.reduce((total, tag) => total + (signatureTags.includes(tag) ? 1 : 0), 0)
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map((entry) => entry.family);
+
+  const adjectives = [
+    ...matchingFamilies.flatMap((family) => family.adjectives),
+    ...(audioVector[1] ?? 0) > 0.7 ? ["Fever", "Rapid", "Restless"] : [],
+    ...(audioVector[1] ?? 0) < 0.35 ? ["Quiet", "Soft", "Still"] : [],
+    ...(audioVector[3] ?? 0) < 0.35 ? ["Faded", "Tender", "Haunted"] : [],
+    ...(audioVector[3] ?? 0) > 0.68 ? ["Bright", "Golden", "Lively"] : [],
+    ...(audioVector[4] ?? 0) > 0.62 ? ["Earthbound", "Plainspoken", "Warm"] : [],
+    ...(audioVector[6] ?? 0) > 0.66 ? ["Luminous", "Radiant", "Neon"] : [],
+    ...(audioVector[6] ?? 0) < 0.32 ? ["Dusky", "Lowlight", "Shadow"] : [],
+    ...namingFallback.adjectives
+  ];
+
+  const textures = [
+    ...matchingFamilies.flatMap((family) => family.textures),
+    ...(audioVector[5] ?? 0) > 0.62 ? ["Mist", "Halo", "Echo"] : [],
+    ...(audioVector[1] ?? 0) > 0.72 ? ["Voltage", "Chrome", "Strobe"] : [],
+    ...(audioVector[4] ?? 0) > 0.64 ? ["Cedar", "Amber", "Canvas"] : [],
+    ...(audioVector[6] ?? 0) < 0.32 ? ["Ash", "Smoke", "Obsidian"] : [],
+    ...namingFallback.textures
+  ];
+
+  const nouns = [
+    ...matchingFamilies.flatMap((family) => family.nouns),
+    ...(audioVector[2] ?? 0) > 0.7 ? ["Pulse", "Motion", "Drive"] : [],
+    ...(audioVector[0] ?? 0) < 0.34 ? ["Drift", "Tide", "Harbor"] : [],
+    ...(audioVector[0] ?? 0) > 0.68 ? ["Ignition", "Surge", "Rush"] : [],
+    ...(audioVector[5] ?? 0) > 0.64 ? ["Passage", "Sky", "Arc"] : [],
+    ...namingFallback.nouns
+  ];
+
+  const accentTags = signatureTags.filter(
+    (tag) => /^[a-z0-9& -]{3,18}$/i.test(tag) && !lowValueNameTags.has(tag) && !isDecadeTag(tag)
   );
 
-  const preferredModels = [
-    normalizeGeminiModel(settings.geminiModel),
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-flash-lite-latest",
-    "gemini-flash-latest",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash-preview",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite-001",
-    "gemini-2.0-flash-001"
-  ];
-  const apiVersions = ["v1beta", "v1"];
-  const listedModelsByVersion = new Map<string, string[]>();
-  for (const apiVersion of apiVersions) {
-    try {
-      const listResponse = await fetch(
-        `https://generativelanguage.googleapis.com/${apiVersion}/models?key=${encodeURIComponent(settings.geminiApiKey)}`,
-        { signal: AbortSignal.timeout(8000) }
-      );
-      if (!listResponse.ok) {
-        continue;
-      }
-      const listPayload = (await listResponse.json()) as {
-        models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
-      };
-      const available = (listPayload.models ?? [])
-        .filter((model) => (model.supportedGenerationMethods ?? []).includes("generateContent"))
-        .map((model) => model.name ?? "")
-        .filter(Boolean)
-        .map((name) => name.replace(/^models\//, ""));
-      listedModelsByVersion.set(apiVersion, available);
-    } catch {
-      continue;
-    }
-  }
-  const defaultListed = [...new Set(preferredModels)];
-  let lastError = "Unknown Gemini failure";
-  for (const apiVersion of apiVersions) {
-    const listed = listedModelsByVersion.get(apiVersion) ?? defaultListed;
-    const orderedModels = [
-      ...preferredModels.filter((model, index) => preferredModels.indexOf(model) === index && listed.includes(model)),
-      ...listed.filter((model) => !preferredModels.includes(model))
-    ];
-    for (const model of orderedModels) {
-      for (const useJsonMime of [true, false]) {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(settings.geminiApiKey)}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            signal: AbortSignal.timeout(12000),
-            body: JSON.stringify({
-              generationConfig: {
-                temperature: 0.3,
-                topP: 0.8,
-                ...(useJsonMime ? { responseMimeType: "application/json" } : {})
-              },
-              contents: [{ role: "user", parts: [{ text: prompt }] }]
-            })
-          }
-        );
-        const payload = (await response.json()) as {
-          error?: { message?: string };
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-        if (!response.ok) {
-          lastError = payload.error?.message ?? `Gemini request failed (${response.status})`;
-          continue;
-        }
-        const rawText = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("\n") ?? "";
-        if (!rawText.trim()) {
-          lastError = "Gemini returned empty content";
-          continue;
-        }
-        const cleanedText = rawText
-          .replace(/^```json\s*/i, "")
-          .replace(/^```\s*/i, "")
-          .replace(/\s*```$/i, "")
-          .trim();
-        try {
-          const parsed = JSON.parse(cleanedText) as { plans?: unknown[] };
-          const plans = (parsed.plans ?? [])
-            .map((item) => sanitizeAiPlaylistPlan(item))
-            .filter((item): item is AiPlaylistPlan => Boolean(item));
-          if (plans.length) {
-            if (model !== settings.geminiModel || apiVersion !== "v1beta") {
-              appendLog({
-                level: "info",
-                scope: "playlist",
-                message: "Gemini fallback path used for playlist planning",
-                meta: { requestedModel: settings.geminiModel, activeModel: model, apiVersion, jsonMime: useJsonMime }
-              });
-            }
-            return plans.slice(0, 10);
-          }
-          lastError = "Gemini response had no valid plans";
-        } catch (error) {
-          lastError = error instanceof Error ? error.message : "Failed to parse Gemini response";
-        }
-      }
-    }
-  }
-  throw new Error(lastError);
+  const dominantFamily = matchingFamilies[0]?.id ?? ((audioVector[1] ?? 0) > 0.66 ? "kinetic" : (audioVector[3] ?? 0) < 0.38 ? "nocturnal" : "hybrid");
+
+  return {
+    dominantFamily,
+    adjectives: uniqueWordPool(adjectives),
+    textures: uniqueWordPool(textures),
+    nouns: uniqueWordPool(nouns),
+    accentTags
+  };
 }
 
-async function generateAiPlaylistPlans(tracks: Array<{ id: number; title: string; artist: string; year: number | null; tags: string[] }>): Promise<AiPlaylistPlan[]> {
-  if (!settings.geminiApiKey) {
-    throw new Error("GEMINI_API_KEY is required for AI-only playlist generation");
+function buildGeneratedPlaylistName(signatureTags: string[], audioVector: number[], seedKey: string): string {
+  const pools = inferNamingPools(signatureTags, audioVector);
+  const seed = `${isoWeekKey()}:${seedKey}:${signatureTags.join("|")}:${audioVector.join("|")}:${pools.dominantFamily}`;
+  const random = seededRandom(hashSeed(seed));
+  const adjective = pickWord(random, pools.adjectives, "Velvet");
+  const texture = pickWord(random, pools.textures, "Smoke");
+  const noun = pickWord(random, pools.nouns, "Drift");
+  const accentTag = pools.accentTags[Math.floor(random() * pools.accentTags.length)] ?? "";
+  const accent = accentTag ? titleCaseWords(accentTag) : "";
+  const templates = accent
+    ? [
+        `${adjective} ${noun}`,
+        `${texture} ${noun}`,
+        `${adjective} ${accent} ${noun}`,
+        `${texture} ${accent} ${noun}`,
+        `${accent} ${noun}`
+      ]
+    : [`${adjective} ${noun}`, `${texture} ${noun}`, `${adjective} ${texture}`, `${texture} ${adjective} ${noun}`];
+  const name = templates[Math.floor(random() * templates.length)] ?? `${adjective} ${noun}`;
+  const cleaned = name.replace(/\s+/g, " ").trim();
+  if (cleaned.split(" ").length > 3) {
+    const compact = `${adjective} ${noun}`;
+    return compact.replace(/\s+/g, " ").trim();
   }
-  const shuffled = [...tracks].sort(() => Math.random() - 0.5);
-  try {
-    const geminiPlans = await fetchGeminiPlaylistPlans(shuffled);
-    if (geminiPlans.length) {
-      return geminiPlans;
-    }
-    throw new Error("Gemini returned no valid playlist plans");
-  } catch (error) {
-    throw new Error(error instanceof Error ? error.message : "Gemini playlist planning failed", { cause: error });
+  return cleaned;
+}
+
+function buildGeneratedPlaylistDescription(signatureTags: string[], audioVector: number[], source: PlaylistCandidate["source"]): string {
+  const pools = inferNamingPools(signatureTags, audioVector);
+  const vibe =
+    pools.dominantFamily === "kinetic"
+      ? "higher-energy movement"
+      : pools.dominantFamily === "organic"
+        ? "warm, organic textures"
+        : pools.dominantFamily === "heavy"
+          ? "heavier, high-impact edges"
+          : pools.dominantFamily === "lush"
+            ? "groove-led, fuller color"
+            : pools.dominantFamily === "cinematic"
+              ? "wide, cinematic atmosphere"
+              : "low-light, reflective flow";
+  const focus = signatureTags.slice(0, 4).join(", ");
+  if (source === "discovery") {
+    return `A discovery lane built from overlooked tracks that still align with ${focus || vibe}.`;
   }
+  if (source === "artist") {
+    return `A signature set clustered around ${focus || vibe} with tighter artist relationships.`;
+  }
+  return `A ${vibe} playlist shaped by ${focus || "closely related tags and audio features"}.`;
 }
 
 function normalizeTag(value: string): string {
@@ -1708,41 +1671,71 @@ async function generateCandidates(tracks: TrackRecord[], desiredWeeklyPlaylists:
     audioVectorByTrackId.set(track.id, audioVectorFromTrack(track));
   }
 
-  const aiPlans = await generateAiPlaylistPlans(
-    enriched.map((track) => ({
-      id: track.id,
-      title: track.title ?? "Unknown Title",
-      artist: track.artist ?? "Unknown Artist",
-      year: track.year ?? null,
-      tags: primaryTagsByTrackId.get(track.id) ?? track.tags
-    }))
-  );
-
-  for (const plan of aiPlans) {
-    const centroid = uniqueTags(plan.focusTags.filter((tag) => isPrimaryClusterTag(tag)));
-    if (centroid.length < 2) {
+  const tagHistogram = new Map<string, number>();
+  for (const tags of primaryTagsByTrackId.values()) {
+    for (const tag of tags) {
+      tagHistogram.set(tag, (tagHistogram.get(tag) ?? 0) + 1);
+    }
+  }
+  const topClusterTags = [...tagHistogram.entries()]
+    .filter(([, count]) => count >= 4)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 16)
+    .map(([tag]) => tag);
+  for (const primaryTag of topClusterTags) {
+    const seedTracks = enriched.filter((track) => (primaryTagsByTrackId.get(track.id) ?? []).includes(primaryTag));
+    if (seedTracks.length < 8) {
       continue;
     }
+    const coTagCounts = new Map<string, number>();
+    for (const track of seedTracks) {
+      for (const tag of primaryTagsByTrackId.get(track.id) ?? []) {
+        if (tag === primaryTag) {
+          continue;
+        }
+        coTagCounts.set(tag, (coTagCounts.get(tag) ?? 0) + 1);
+      }
+    }
+    const companionTags = [...coTagCounts.entries()]
+      .filter(([, count]) => count >= 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([tag]) => tag);
+    const centroid = uniqueTags([primaryTag, ...companionTags]).slice(0, 4);
+    const seedAudioVector = averageAudioVector(
+      seedTracks.map((track) => track.id),
+      audioVectorByTrackId
+    );
     const ranked = [...enriched]
       .map((track) => ({
         id: track.id,
         score: (() => {
           const tags = primaryTagsByTrackId.get(track.id) ?? track.tags;
           const overlapBoost = tags.filter((tag) => centroid.includes(tag)).length / centroid.length;
-          const avoidPenalty = plan.avoidTags.some((tag) => tags.includes(tag)) ? 0.6 : 1;
-          return (cosineScore(tags, centroid) * 0.8 + overlapBoost * 0.2) * avoidPenalty;
+          const audioBoost = cosineNumberScore(audioVectorByTrackId.get(track.id) ?? [], seedAudioVector);
+          return cosineScore(tags, centroid) * 0.68 + overlapBoost * 0.2 + audioBoost * 0.12;
         })()
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, playlistPoolTargetSize * 3)
       .map((item) => item.id);
-    const pooled = limitTracksByArtist(ranked, artistByTrackId, maxArtistPerPlaylist, plan.targetSize, maxArtistFallbackPerPlaylist);
+    const pooled = limitTracksByArtist(
+      ranked,
+      artistByTrackId,
+      maxArtistPerPlaylist,
+      clamp(settings.maxTracksPerPlaylist * 2, 24, playlistPoolTargetSize),
+      maxArtistFallbackPerPlaylist
+    );
+    if (pooled.length < 16) {
+      continue;
+    }
+    const name = buildGeneratedPlaylistName(centroid, seedAudioVector, `cluster:${primaryTag}`);
     candidates.push({
-      name: plan.name,
-      slug: slugify(plan.name),
-      description: plan.description,
+      name,
+      slug: slugify(name),
+      description: buildGeneratedPlaylistDescription(centroid, seedAudioVector, "cluster"),
       trackIds: pooled,
-      source: "ai",
+      source: "cluster",
       signatureTags: centroid,
       audioVector: averageAudioVector(pooled, audioVectorByTrackId)
     });
@@ -2189,9 +2182,6 @@ function settingsSnapshot() {
     hasNavidromePassword: Boolean(settings.navidromePassword),
     lastFmApiKey: "",
     hasLastFmApiKey: Boolean(settings.lastFmApiKey),
-    geminiApiKey: "",
-    hasGeminiApiKey: Boolean(settings.geminiApiKey),
-    geminiModel: settings.geminiModel,
     weeklyPlaylistCount: settings.weeklyPlaylistCount,
     maxTracksPerPlaylist: settings.maxTracksPerPlaylist
   };
@@ -2218,12 +2208,6 @@ app.patch("/api/settings", (req, res) => {
   }
   if (body.lastFmApiKey !== undefined) {
     settings.lastFmApiKey = String(body.lastFmApiKey ?? "").trim();
-  }
-  if (body.geminiApiKey !== undefined) {
-    settings.geminiApiKey = String(body.geminiApiKey ?? "").trim();
-  }
-  if (body.geminiModel !== undefined) {
-    settings.geminiModel = normalizeGeminiModel(String(body.geminiModel ?? ""));
   }
   if (body.weeklyPlaylistCount !== undefined) {
     settings.weeklyPlaylistCount = clamp(Number(body.weeklyPlaylistCount), 1, 5);
