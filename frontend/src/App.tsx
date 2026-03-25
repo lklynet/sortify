@@ -61,6 +61,14 @@ type Settings = {
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
 };
+type ConfirmRefreshModal =
+  | {
+      action: "analysis" | "playlists";
+      title: string;
+      message: string;
+      confirmLabel: string;
+    }
+  | null;
 
 const apiBase = import.meta.env.VITE_API_BASE ?? "";
 
@@ -119,6 +127,7 @@ function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [toastEntry, setToastEntry] = useState<OperationLog | null>(null);
+  const [confirmRefreshModal, setConfirmRefreshModal] = useState<ConfirmRefreshModal>(null);
 
   const hasNavidromePassword = Boolean(settingsDraft.navidromePassword.trim() || settingsDraft.hasNavidromePassword);
   const hasSubsonicConnection = Boolean(
@@ -131,7 +140,6 @@ function App() {
     }),
     [settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
   );
-  const recentAnalyzedTracks = useMemo(() => tracks.filter((track) => hasAudioAnalysis(track)).length, [tracks]);
   const mergeSettingsDraft = useCallback(
     (nextSettings: Settings, currentDraft: Settings) => ({
       ...nextSettings,
@@ -225,15 +233,20 @@ function App() {
     }
   };
 
+  const persistSettings = useCallback(async () => {
+    const savedSettings = await callApi<Settings>("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify(settingsPayload)
+    });
+    setSettings(savedSettings);
+    setSettingsDraft((currentDraft) => mergeSettingsDraft(savedSettings, currentDraft));
+    setSettingsDirty(false);
+    return savedSettings;
+  }, [mergeSettingsDraft, settingsPayload]);
+
   const onStartWorker = () =>
     runAction("start", async () => {
-      const savedSettings = await callApi<Settings>("/api/settings", {
-        method: "PATCH",
-        body: JSON.stringify(settingsPayload)
-      });
-      setSettings(savedSettings);
-      setSettingsDraft((currentDraft) => mergeSettingsDraft(savedSettings, currentDraft));
-      setSettingsDirty(false);
+      await persistSettings();
       await callApi("/api/worker/start", {
         method: "POST",
         body: JSON.stringify({
@@ -250,14 +263,62 @@ function App() {
 
   const saveSettings = () =>
     runAction("save-settings", async () => {
-      const savedSettings = await callApi<Settings>("/api/settings", {
-        method: "PATCH",
-        body: JSON.stringify(settingsPayload)
-      });
-      setSettings(savedSettings);
-      setSettingsDraft((currentDraft) => mergeSettingsDraft(savedSettings, currentDraft));
-      setSettingsDirty(false);
+      await persistSettings();
     });
+
+  const refreshAnalyzedTracks = () =>
+    runAction("refresh-analysis", async () => {
+      await persistSettings();
+      await callApi("/api/scan", {
+        method: "POST",
+        body: JSON.stringify({ ...connectionPayload, forceRefreshAnalysis: true })
+      });
+    });
+
+  const refreshPlaylists = () =>
+    runAction("refresh-playlists", async () => {
+      await persistSettings();
+      await callApi("/api/playlists/generate", {
+        method: "POST",
+        body: JSON.stringify({ weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount })
+      });
+      if (hasSubsonicConnection) {
+        await callApi("/api/playlists/apply", {
+          method: "POST",
+          body: JSON.stringify(connectionPayload)
+        });
+      }
+    });
+
+  const openRefreshConfirmation = (action: "analysis" | "playlists") => {
+    setConfirmRefreshModal(
+      action === "analysis"
+        ? {
+            action,
+            title: "Refresh analyzed tracks?",
+            message: "This will run a full scan and force audio analysis to run again for discovered tracks.",
+            confirmLabel: "Refresh analysis"
+          }
+        : {
+            action,
+            title: "Refresh playlists?",
+            message: "This will generate a fresh set of recommended playlists and apply them to Navidrome if syncing is configured.",
+            confirmLabel: "Refresh playlists"
+          }
+    );
+  };
+
+  const confirmRefreshAction = async () => {
+    const pendingAction = confirmRefreshModal?.action;
+    setConfirmRefreshModal(null);
+    if (pendingAction === "analysis") {
+      await refreshAnalyzedTracks();
+      return;
+    }
+    if (pendingAction === "playlists") {
+      await refreshPlaylists();
+    }
+  };
 
   return (
     <main className="layout">
@@ -448,8 +509,17 @@ function App() {
 
       <section className="content-grid">
         <article className="panel">
-          <div className="panel-header">
+          <div className="panel-header panel-header-actions">
             <h3>Recently tagged tracks</h3>
+            <button
+              className="ghost-button icon-button"
+              onClick={() => openRefreshConfirmation("analysis")}
+              disabled={!hasSubsonicConnection || busyAction !== null}
+              aria-label="Force refresh analysis"
+              title="Force refresh analysis"
+            >
+              {busyAction === "refresh-analysis" ? "…" : "↻"}
+            </button>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
             <ul className="trackList">
@@ -500,8 +570,17 @@ function App() {
         </article>
 
         <article className="panel">
-          <div className="panel-header">
+          <div className="panel-header panel-header-actions">
             <h3>Current playlists</h3>
+            <button
+              className="ghost-button icon-button"
+              onClick={() => openRefreshConfirmation("playlists")}
+              disabled={busyAction !== null}
+              aria-label="Force refresh playlists"
+              title="Force refresh playlists"
+            >
+              {busyAction === "refresh-playlists" ? "…" : "↻"}
+            </button>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
             <ul className="playlistList">
@@ -536,6 +615,22 @@ function App() {
           </div>
           <p>{toastEntry.message}</p>
         </aside>
+      ) : null}
+      {confirmRefreshModal ? (
+        <div className="modal-backdrop" role="presentation" onClick={() => setConfirmRefreshModal(null)}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="refresh-confirm-title" onClick={(event) => event.stopPropagation()}>
+            <h3 id="refresh-confirm-title">{confirmRefreshModal.title}</h3>
+            <p>{confirmRefreshModal.message}</p>
+            <div className="modal-actions">
+              <button className="modal-cancel" onClick={() => setConfirmRefreshModal(null)} disabled={busyAction !== null}>
+                Cancel
+              </button>
+              <button onClick={() => void confirmRefreshAction()} disabled={busyAction !== null}>
+                {confirmRefreshModal.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </main>
   );

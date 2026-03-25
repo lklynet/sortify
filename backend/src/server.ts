@@ -358,6 +358,7 @@ const readTrackScanStateStmt = db.prepare(`
 SELECT path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at
 FROM tracks
 `);
+const deleteTrackByPathStmt = db.prepare("DELETE FROM tracks WHERE path = ?");
 
 const markPlaylistsNotRecommendedStmt = db.prepare("UPDATE playlists SET is_recommended = 0");
 const findPlaylistBySlugStmt = db.prepare(
@@ -1299,9 +1300,12 @@ async function fetchSubsonicSongs(connection: SubsonicConnection): Promise<Subso
 
 async function scanLibrary(
   connection: SubsonicConnection,
-  onProgress?: (progress: Partial<Pick<ScanProgress, "scannedFiles" | "processedFiles" | "updatedTracks" | "errors">>) => void
+  onProgress?: (progress: Partial<Pick<ScanProgress, "scannedFiles" | "processedFiles" | "updatedTracks" | "errors">>) => void,
+  options?: { forceRefreshAnalysis?: boolean }
 ) {
+  const forceRefreshAnalysis = Boolean(options?.forceRefreshAnalysis);
   const discovered = await fetchSubsonicSongs(connection);
+  const discoveredPaths = new Set(discovered.map((song) => `subsonic:${song.id}`));
   const existingRows = readTrackScanStateStmt.all() as Array<{
     path: string;
     title: string | null;
@@ -1319,11 +1323,13 @@ async function scanLibrary(
   for (const row of existingRows) {
     existingByPath.set(row.path, row);
   }
+  const stalePaths = existingRows.map((row) => row.path).filter((trackPath) => !discoveredPaths.has(trackPath));
   const now = new Date().toISOString();
   let updated = 0;
   let processed = 0;
   let skipped = 0;
   let errors = 0;
+  let pruned = 0;
   appendLog({
     level: "info",
     scope: "scan",
@@ -1352,7 +1358,7 @@ async function scanLibrary(
       (existing.artist ?? "Unknown Artist") === artist &&
       (existing.album ?? "Unknown Album") === album &&
       (existing.duration ?? null) === duration;
-    const shouldHydrate = !unchanged || existingTags.length < 6 || !hasFreshAudioAnalysis(existing);
+    const shouldHydrate = forceRefreshAnalysis || !unchanged || existingTags.length < 6 || !hasFreshAudioAnalysis(existing);
     if (!shouldHydrate) {
       processed += 1;
       skipped += 1;
@@ -1423,13 +1429,28 @@ async function scanLibrary(
       });
     }
   }
+  if (stalePaths.length) {
+    const pruneTransaction = db.transaction((paths: string[]) => {
+      for (const stalePath of paths) {
+        deleteTrackByPathStmt.run(stalePath);
+      }
+    });
+    pruneTransaction(stalePaths);
+    pruned = stalePaths.length;
+    appendLog({
+      level: "info",
+      scope: "scan",
+      message: "Stale tracks pruned after scan",
+      meta: { prunedTracks: pruned }
+    });
+  }
   appendLog({
     level: "info",
     scope: "scan",
     message: "Scan completed",
-    meta: { source: connection.baseUrl, scannedFiles: discovered.length, processedFiles: processed, updatedTracks: updated, skippedTracks: skipped, errors }
+    meta: { source: connection.baseUrl, scannedFiles: discovered.length, processedFiles: processed, updatedTracks: updated, skippedTracks: skipped, errors, prunedTracks: pruned }
   });
-  return { scannedFiles: discovered.length, updatedTracks: updated, processedFiles: processed, errors };
+  return { scannedFiles: discovered.length, updatedTracks: updated, processedFiles: processed, errors, prunedTracks: pruned };
 }
 
 function tagsFromTrack(track: TrackRecord): string[] {
@@ -2310,7 +2331,7 @@ app.post("/api/worker/stop", (_req, res) => {
 app.post("/api/scan", async (req, res) => {
   try {
     const connection = getSubsonicConnection(req.body);
-    const result = await scanLibrary(connection);
+    const result = await scanLibrary(connection, undefined, { forceRefreshAnalysis: Boolean(req.body?.forceRefreshAnalysis) });
     await refreshRecommendedPlaylists();
     res.json(result);
   } catch (error) {
@@ -2356,14 +2377,18 @@ app.post("/api/scan/start", (req, res) => {
     current.status = "running";
     scanJobs.set(id, current);
     try {
-      const result = await scanLibrary(connection, (progress) => {
+      const result = await scanLibrary(
+        connection,
+        (progress) => {
         const active = scanJobs.get(id);
         if (!active) {
           return;
         }
         Object.assign(active, progress);
         scanJobs.set(id, active);
-      });
+        },
+        { forceRefreshAnalysis: Boolean(req.body?.forceRefreshAnalysis) }
+      );
       const completed = scanJobs.get(id);
       if (!completed) {
         return;
