@@ -449,7 +449,7 @@ function App() {
       <section className="content-grid">
         <article className="panel">
           <div className="panel-header">
-            <h3>Recent tagged tracks · {tracks.length} / {stats.tracks} · analyzed {recentAnalyzedTracks}</h3>
+            <h3>Recently tagged tracks</h3>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
             <ul className="trackList">
@@ -501,7 +501,7 @@ function App() {
 
         <article className="panel">
           <div className="panel-header">
-            <h3>Current playlists · {settingsDraft.weeklyPlaylistCount} / week · max {settingsDraft.maxTracksPerPlaylist} tracks</h3>
+            <h3>Current playlists</h3>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
             <ul className="playlistList">
