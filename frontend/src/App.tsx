@@ -31,6 +31,9 @@ type Playlist = {
   description: string;
   mode: "dynamic" | "pinned" | "locked";
   updated_at: string;
+  artworkUrl: string | null;
+  artworkAttribution: string | null;
+  artworkAttributionUrl: string | null;
   tracks: Array<{ id: number; title: string; artist: string; album: string; path: string }>;
 };
 type Track = {
@@ -60,6 +63,8 @@ type Settings = {
   hasNavidromePassword: boolean;
   lastFmApiKey: string;
   hasLastFmApiKey: boolean;
+  pexelsApiKey: string;
+  hasPexelsApiKey: boolean;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
 };
@@ -84,6 +89,16 @@ async function callApi<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(payload.error ?? "Request failed");
   }
   return payload as T;
+}
+
+function assetUrl(url: string | null) {
+  if (!url) {
+    return "";
+  }
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+  return `${apiBase}${url}`;
 }
 
 function formatPercent(value: number) {
@@ -125,6 +140,8 @@ function App() {
     hasNavidromePassword: false,
     lastFmApiKey: "",
     hasLastFmApiKey: false,
+    pexelsApiKey: "",
+    hasPexelsApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
   });
@@ -135,6 +152,8 @@ function App() {
     hasNavidromePassword: false,
     lastFmApiKey: "",
     hasLastFmApiKey: false,
+    pexelsApiKey: "",
+    hasPexelsApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
   });
@@ -149,6 +168,8 @@ function App() {
   const [toastEntry, setToastEntry] = useState<OperationLog | null>(null);
   const [confirmRefreshModal, setConfirmRefreshModal] = useState<ConfirmRefreshModal>(null);
   const playlistReorderOnNextLoadRef = useRef(true);
+  const seenToastIdsRef = useRef<Set<string>>(new Set());
+  const hasLoadedLogsRef = useRef(false);
 
   const hasNavidromePassword = Boolean(settingsDraft.navidromePassword.trim() || settingsDraft.hasNavidromePassword);
   const hasSubsonicConnection = Boolean(
@@ -161,13 +182,16 @@ function App() {
     }),
     [settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
   );
+  const artworkStatus = Boolean(settingsDraft.pexelsApiKey.trim() || settingsDraft.hasPexelsApiKey);
   const mergeSettingsDraft = useCallback(
     (nextSettings: Settings, currentDraft: Settings) => ({
       ...nextSettings,
       navidromePassword: currentDraft.navidromePassword,
       lastFmApiKey: currentDraft.lastFmApiKey,
+      pexelsApiKey: currentDraft.pexelsApiKey,
       hasNavidromePassword: nextSettings.hasNavidromePassword || currentDraft.navidromePassword.trim().length > 0,
-      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0
+      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0,
+      hasPexelsApiKey: nextSettings.hasPexelsApiKey || currentDraft.pexelsApiKey.trim().length > 0
     }),
     []
   );
@@ -183,6 +207,9 @@ function App() {
     }
     if (settingsDraft.lastFmApiKey.trim()) {
       nextSettings.lastFmApiKey = settingsDraft.lastFmApiKey.trim();
+    }
+    if (settingsDraft.pexelsApiKey.trim()) {
+      nextSettings.pexelsApiKey = settingsDraft.pexelsApiKey.trim();
     }
     return nextSettings;
   }, [settingsDraft]);
@@ -250,8 +277,28 @@ function App() {
     if (!logs.length) {
       return;
     }
-    setToastEntry(logs[0]);
+    if (!hasLoadedLogsRef.current) {
+      hasLoadedLogsRef.current = true;
+      seenToastIdsRef.current = new Set(logs.map((entry) => entry.id));
+      return;
+    }
+    const nextToast = logs.find((entry) => !seenToastIdsRef.current.has(entry.id));
+    if (!nextToast) {
+      return;
+    }
+    seenToastIdsRef.current.add(nextToast.id);
+    setToastEntry(nextToast);
   }, [logs]);
+
+  useEffect(() => {
+    if (!toastEntry) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setToastEntry((current) => (current?.id === toastEntry.id ? null : current));
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [toastEntry]);
 
   const runAction = async (action: string, fn: () => Promise<void>) => {
     setBusyAction(action);
@@ -462,6 +509,19 @@ function App() {
                       placeholder={settingsDraft.hasLastFmApiKey ? "****************" : "enter Last.fm key"}
                     />
                   </div>
+                  <div className="field">
+                    <label htmlFor="pexelsApiKey">Pexels API Key</label>
+                    <input
+                      id="pexelsApiKey"
+                      type="password"
+                      value={settingsDraft.pexelsApiKey}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, pexelsApiKey: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                      placeholder={settingsDraft.hasPexelsApiKey ? "****************" : "enter Pexels key"}
+                    />
+                  </div>
                 </div>
               </section>
 
@@ -533,6 +593,7 @@ function App() {
           <div className="signal-row">
             <span className={`signal ${hasSubsonicConnection ? "ok" : "bad"}`}>Navidrome {hasSubsonicConnection ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.lastfm ? "ok" : "warn"}`}>Last.fm {keyStatus.lastfm ? "Ready" : "Optional"}</span>
+            <span className={`signal ${artworkStatus ? "ok" : "warn"}`}>Pexels {artworkStatus ? "Ready" : "Optional"}</span>
             <span className={`signal ${stats.analyzedTracks ? "ok" : "warn"}`}>Analyzed {stats.analyzedTracks}/{stats.tracks}</span>
             <span className="signal neutral">Playlists/Week {settings.weeklyPlaylistCount}</span>
             <span className="signal neutral">Max Tracks {settings.maxTracksPerPlaylist}</span>
@@ -630,38 +691,54 @@ function App() {
             <ul className="playlistList">
               {playlists.map((playlist) => (
                 <li key={playlist.id}>
-                  <div className="playlistTopRow">
-                    <div>
-                      <div className="playlistHead">
-                        <strong>{playlist.name}</strong>
+                  <div className="playlistCard">
+                    {playlist.artworkUrl ? (
+                      <img className="playlistArtwork" src={assetUrl(playlist.artworkUrl)} alt={`${playlist.name} cover art`} />
+                    ) : (
+                      <div className="playlistArtwork playlistArtworkFallback" aria-hidden="true">
+                        {playlist.name.slice(0, 1).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="playlistBody">
+                      <div className="playlistTopRow">
+                        <div>
+                          <div className="playlistHead">
+                            <strong>{playlist.name}</strong>
+                          </div>
+                        </div>
+                        {(() => {
+                          const currentMode = playlistModeMeta(playlist.mode);
+                          const nextMode = nextPlaylistMode(playlist.mode);
+                          const nextModeInfo = playlistModeMeta(nextMode);
+                          const actionId = `playlist-mode-${playlist.id}-${nextMode}`;
+                          return (
+                            <button
+                              type="button"
+                              className={`ghost-button playlistModeToggle ${playlist.mode}`}
+                              onClick={() => updatePlaylistMode(playlist.id, nextMode)}
+                              disabled={busyAction !== null}
+                              aria-label={`${playlist.name} mode ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
+                              title={`Mode: ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
+                            >
+                              {busyAction === actionId ? "…" : <currentMode.Icon className="playlistModeIcon" aria-hidden="true" />}
+                            </button>
+                          );
+                        })()}
+                      </div>
+                      <p>{playlist.description}</p>
+                      {playlist.artworkAttribution && playlist.artworkAttributionUrl ? (
+                        <a className="playlistAttribution" href={playlist.artworkAttributionUrl} target="_blank" rel="noreferrer">
+                          {playlist.artworkAttribution}
+                        </a>
+                      ) : null}
+                      <div className="playlistTracks">
+                        {playlist.tracks.map((track) => (
+                          <span key={track.id}>
+                            {track.title || "Untitled"} — {track.artist || "Unknown"}
+                          </span>
+                        ))}
                       </div>
                     </div>
-                    {(() => {
-                      const currentMode = playlistModeMeta(playlist.mode);
-                      const nextMode = nextPlaylistMode(playlist.mode);
-                      const nextModeInfo = playlistModeMeta(nextMode);
-                      const actionId = `playlist-mode-${playlist.id}-${nextMode}`;
-                      return (
-                        <button
-                          type="button"
-                          className={`ghost-button playlistModeToggle ${playlist.mode}`}
-                          onClick={() => updatePlaylistMode(playlist.id, nextMode)}
-                          disabled={busyAction !== null}
-                          aria-label={`${playlist.name} mode ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
-                          title={`Mode: ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
-                        >
-                          {busyAction === actionId ? "…" : <currentMode.Icon className="playlistModeIcon" aria-hidden="true" />}
-                        </button>
-                      );
-                    })()}
-                  </div>
-                  <p>{playlist.description}</p>
-                  <div className="playlistTracks">
-                    {playlist.tracks.map((track) => (
-                      <span key={track.id}>
-                        {track.title || "Untitled"} — {track.artist || "Unknown"}
-                      </span>
-                    ))}
                   </div>
                 </li>
               ))}

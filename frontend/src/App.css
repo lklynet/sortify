@@ -602,6 +602,37 @@ button:disabled {
   gap: 1rem;
 }
 
+.playlistCard {
+  display: grid;
+  grid-template-columns: 108px minmax(0, 1fr);
+  gap: 0.95rem;
+  align-items: start;
+}
+
+.playlistArtwork {
+  width: 108px;
+  height: 108px;
+  object-fit: cover;
+  border-radius: 1rem;
+  display: block;
+  background: linear-gradient(135deg, rgba(84, 160, 255, 0.35), rgba(255, 107, 107, 0.25));
+  box-shadow: 0 18px 32px rgba(0, 0, 0, 0.22);
+}
+
+.playlistArtworkFallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 2.1rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.playlistBody {
+  min-width: 0;
+}
+
 .playlistTopRow {
   display: flex;
   justify-content: space-between;
@@ -656,6 +687,19 @@ button:disabled {
   color: var(--text-muted);
 }
 
+.playlistAttribution {
+  display: inline-flex;
+  margin-top: -0.1rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.7rem;
+  color: var(--secondary);
+  text-decoration: none;
+}
+
+.playlistAttribution:hover {
+  color: var(--text);
+}
+
 .playlistTracks {
   display: flex;
   flex-wrap: wrap;
@@ -704,6 +748,16 @@ button:disabled {
   .playlistTopRow {
     flex-direction: column;
     gap: 0.45rem;
+  }
+
+  .playlistCard {
+    grid-template-columns: 1fr;
+  }
+
+  .playlistArtwork {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1 / 1;
   }
 
   .playlistTopRow > div {

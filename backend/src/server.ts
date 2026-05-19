@@ -2,6 +2,7 @@ import cors from "cors";
 import Database from "better-sqlite3";
 import { config } from "dotenv";
 import express from "express";
+import sharp from "sharp";
 import { spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync } from "node:crypto";
 import fs from "node:fs";
@@ -35,6 +36,11 @@ type PlaylistRecord = {
   sync_target: "subsonic";
   is_recommended: number;
   updated_at: string;
+  artwork_path: string;
+  artwork_attribution: string;
+  artwork_attribution_url: string;
+  artwork_signature: string;
+  artwork_updated_at: string;
 };
 
 type PlaylistCandidate = {
@@ -75,6 +81,7 @@ type AppSettings = {
   navidromeUsername: string;
   navidromePassword: string;
   lastFmApiKey: string;
+  pexelsApiKey: string;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
 };
@@ -93,6 +100,8 @@ type SubsonicConnection = {
   username: string;
   password: string;
 };
+
+type SubsonicQueryParams = Record<string, string | readonly string[]>;
 
 type SubsonicSong = {
   id: string;
@@ -145,6 +154,19 @@ for (const envFile of envCandidates) {
   }
 }
 
+if (!process.env.FONTCONFIG_FILE || !process.env.FONTCONFIG_PATH) {
+  const fontConfigCandidates = [
+    "/opt/homebrew/etc/fonts/fonts.conf",
+    "/usr/local/etc/fonts/fonts.conf",
+    "/etc/fonts/fonts.conf"
+  ];
+  const fontConfigFile = fontConfigCandidates.find((candidate) => fs.existsSync(candidate));
+  if (fontConfigFile) {
+    process.env.FONTCONFIG_FILE ??= fontConfigFile;
+    process.env.FONTCONFIG_PATH ??= path.dirname(fontConfigFile);
+  }
+}
+
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
 const dbFile = process.env.SORTIFY_DB_PATH ?? path.resolve(process.cwd(), "data", "sortify.db");
@@ -158,8 +180,11 @@ const defaultSubsonicUrl = process.env.SUBSONIC_URL ?? "";
 const defaultSubsonicUser = process.env.SUBSONIC_USER ?? "";
 const defaultSubsonicPassword = process.env.SUBSONIC_PASSWORD ?? "";
 const defaultLastFmApiKey = process.env.LASTFM_API_KEY ?? "";
+const defaultPexelsApiKey = process.env.PEXELS_API_KEY ?? "";
 const defaultMaxTracksPerPlaylist = Math.max(5, Math.min(100, Number(process.env.MAX_TRACKS_PER_PLAYLIST ?? 20)));
 const settingsKeyFile = process.env.SORTIFY_SETTINGS_KEY_FILE ?? path.resolve(path.dirname(dbFile), ".sortify-settings.key");
+const generatedArtworkDir = process.env.SORTIFY_ARTWORK_PATH ?? path.resolve(path.dirname(dbFile), "artwork");
+const playlistArtworkRenderVersion = "v18";
 const audioAnalysisScriptFile = path.resolve(serverDir, "../scripts/analyze_track.py");
 const audioAnalysisVersion = "audio-v1";
 const audioAnalysisEnabled = process.env.AUDIO_ANALYSIS_ENABLED !== "false";
@@ -187,6 +212,7 @@ const settings: AppSettings = {
   navidromeUsername: defaultSubsonicUser,
   navidromePassword: defaultSubsonicPassword,
   lastFmApiKey: defaultLastFmApiKey,
+  pexelsApiKey: defaultPexelsApiKey,
   weeklyPlaylistCount: 3,
   maxTracksPerPlaylist: defaultMaxTracksPerPlaylist
 };
@@ -265,6 +291,7 @@ function decryptSettingValue(value: string) {
 }
 
 fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+fs.mkdirSync(generatedArtworkDir, { recursive: true });
 const db = new Database(dbFile);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
@@ -297,7 +324,12 @@ CREATE TABLE IF NOT EXISTS playlists (
   mode TEXT NOT NULL DEFAULT 'live',
   selected INTEGER NOT NULL DEFAULT 0,
   sync_target TEXT NOT NULL DEFAULT 'subsonic',
-  is_recommended INTEGER NOT NULL DEFAULT 1
+  is_recommended INTEGER NOT NULL DEFAULT 1,
+  artwork_path TEXT NOT NULL DEFAULT '',
+  artwork_attribution TEXT NOT NULL DEFAULT '',
+  artwork_attribution_url TEXT NOT NULL DEFAULT '',
+  artwork_signature TEXT NOT NULL DEFAULT '',
+  artwork_updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS playlist_tracks (
   playlist_id INTEGER NOT NULL,
@@ -345,6 +377,21 @@ if (!hasColumn("sync_target")) {
 if (!hasColumn("is_recommended")) {
   db.exec("ALTER TABLE playlists ADD COLUMN is_recommended INTEGER NOT NULL DEFAULT 1");
 }
+if (!hasColumn("artwork_path")) {
+  db.exec("ALTER TABLE playlists ADD COLUMN artwork_path TEXT NOT NULL DEFAULT ''");
+}
+if (!hasColumn("artwork_attribution")) {
+  db.exec("ALTER TABLE playlists ADD COLUMN artwork_attribution TEXT NOT NULL DEFAULT ''");
+}
+if (!hasColumn("artwork_attribution_url")) {
+  db.exec("ALTER TABLE playlists ADD COLUMN artwork_attribution_url TEXT NOT NULL DEFAULT ''");
+}
+if (!hasColumn("artwork_signature")) {
+  db.exec("ALTER TABLE playlists ADD COLUMN artwork_signature TEXT NOT NULL DEFAULT ''");
+}
+if (!hasColumn("artwork_updated_at")) {
+  db.exec("ALTER TABLE playlists ADD COLUMN artwork_updated_at TEXT NOT NULL DEFAULT ''");
+}
 db.exec("UPDATE playlists SET mode = 'locked' WHERE mode = 'frozen'");
 db.exec("UPDATE playlists SET mode = 'dynamic' WHERE mode NOT IN ('dynamic', 'pinned', 'locked')");
 db.exec("UPDATE playlists SET sync_target = 'subsonic' WHERE sync_target = 'm3u'");
@@ -352,6 +399,7 @@ db.exec("UPDATE playlists SET updated_at = CASE WHEN updated_at = '' THEN create
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use("/generated-artwork", express.static(generatedArtworkDir));
 
 const readTracksStmt = db.prepare(`
 SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at
@@ -385,7 +433,9 @@ const deleteTrackByPathStmt = db.prepare("DELETE FROM tracks WHERE path = ?");
 
 const markPlaylistsNotRecommendedStmt = db.prepare("UPDATE playlists SET is_recommended = 0 WHERE mode = 'dynamic'");
 const findPlaylistBySlugStmt = db.prepare(
-  "SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at FROM playlists WHERE slug = ?"
+  `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at,
+          artwork_path, artwork_attribution, artwork_attribution_url, artwork_signature, artwork_updated_at
+   FROM playlists WHERE slug = ?`
 );
 const insertPlaylistStmt = db.prepare(`
 INSERT INTO playlists (slug, name, description, created_at, updated_at, mode, selected, sync_target, is_recommended)
@@ -403,6 +453,15 @@ const refreshProtectedPlaylistStmt = db.prepare(`
 UPDATE playlists
 SET updated_at = @updated_at,
     is_recommended = 1
+WHERE id = @id
+`);
+const updatePlaylistArtworkStmt = db.prepare(`
+UPDATE playlists
+SET artwork_path = @artwork_path,
+    artwork_attribution = @artwork_attribution,
+    artwork_attribution_url = @artwork_attribution_url,
+    artwork_signature = @artwork_signature,
+    artwork_updated_at = @artwork_updated_at
 WHERE id = @id
 `);
 const deletePlaylistByIdStmt = db.prepare("DELETE FROM playlists WHERE id = ?");
@@ -437,6 +496,12 @@ function loadPersistedSettings() {
     settings.lastFmApiKey = decrypted.value;
     secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
   }
+  const persistedPexelsApiKey = read("pexelsApiKey");
+  if (persistedPexelsApiKey !== undefined) {
+    const decrypted = decryptSettingValue(persistedPexelsApiKey);
+    settings.pexelsApiKey = decrypted.value;
+    secretsNeedMigration = secretsNeedMigration || decrypted.needsMigration;
+  }
   const weekly = Number.parseInt(read("weeklyPlaylistCount") ?? "", 10);
   if (!Number.isNaN(weekly)) {
     settings.weeklyPlaylistCount = clamp(weekly, 1, 5);
@@ -464,6 +529,7 @@ function persistSettings() {
     upsertSettingStmt.run("navidromeUsername", settings.navidromeUsername);
     upsertSettingStmt.run("navidromePassword", encryptSettingValue(settings.navidromePassword));
     upsertSettingStmt.run("lastFmApiKey", encryptSettingValue(settings.lastFmApiKey));
+    upsertSettingStmt.run("pexelsApiKey", encryptSettingValue(settings.pexelsApiKey));
     upsertSettingStmt.run("weeklyPlaylistCount", String(settings.weeklyPlaylistCount));
     upsertSettingStmt.run("maxTracksPerPlaylist", String(settings.maxTracksPerPlaylist));
     upsertSettingStmt.run("workerRunning", String(workerState.running));
@@ -563,7 +629,12 @@ const tagAliases: Record<string, string> = {
 
 const lastFmArtistTagsCache = new Map<string, string[]>();
 const lastFmAlbumTagsCache = new Map<string, string[]>();
+const lastFmArtistImageCache = new Map<string, { imageUrl: string; artistUrl: string } | null>();
 const musicBrainzArtistTagsCache = new Map<string, string[]>();
+const lastFmPlaceholderImageFragments = [
+  "2a96cbd8b46e442fc41c2b86b821562f",
+  "4128a6eb29f94943c9d206c08e625904"
+];
 
 const lowSignalTags = new Set(["decade", "low tempo", "mid tempo", "year"]);
 const playlistPoolTargetSize = 72;
@@ -712,6 +783,352 @@ function extractSubsonicSongId(pathValue: string): string | null {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function hashText(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function sanitizeFilename(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "playlist";
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function estimateTextWidth(text: string, fontSize: number) {
+  return text.length * fontSize * 0.54;
+}
+
+function dedupeAdjacentWords(value: string): string {
+  const words = value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const collapsed: string[] = [];
+  for (const word of words) {
+    const previous = collapsed[collapsed.length - 1];
+    if (previous && previous.toLowerCase() === word.toLowerCase()) {
+      continue;
+    }
+    collapsed.push(word);
+  }
+  return collapsed.join(" ").trim();
+}
+
+function buildTitleLineCandidates(title: string): string[][] {
+  const words = dedupeAdjacentWords(title).split(/\s+/).filter(Boolean);
+  if (!words.length) {
+    return [["Untitled", "Playlist"]];
+  }
+  const candidates: string[][] = [words];
+  let current = [...words];
+  while (current.length > 1) {
+    let mergeIndex = 0;
+    let smallestCombinedLength = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < current.length - 1; index += 1) {
+      const combinedLength = current[index].length + current[index + 1].length;
+      if (combinedLength < smallestCombinedLength) {
+        smallestCombinedLength = combinedLength;
+        mergeIndex = index;
+      }
+    }
+    current = current.flatMap((line, index) => {
+      if (index === mergeIndex) {
+        return [`${current[index]} ${current[index + 1]}`];
+      }
+      if (index === mergeIndex + 1) {
+        return [];
+      }
+      return [line];
+    });
+    candidates.push(current);
+  }
+  return candidates;
+}
+
+function fitTitleLayout(title: string) {
+  const cleanedTitle = dedupeAdjacentWords(title) || "Untitled Playlist";
+  const maxWidth = 1040;
+  const maxHeight = 1040;
+  const lineCandidates = buildTitleLineCandidates(cleanedTitle);
+  for (const lines of lineCandidates) {
+    for (let fontSize = 240; fontSize >= 54; fontSize -= 2) {
+      const longest = Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)));
+      const lineHeight = Math.round(fontSize * 0.86);
+      const blockHeight = fontSize + Math.max(0, lines.length - 1) * lineHeight;
+      if (longest <= maxWidth && blockHeight <= maxHeight) {
+        return {
+          lines,
+          fontSize,
+          lineHeight,
+          blockHeight
+        };
+      }
+    }
+  }
+  const fallbackFont = 54;
+  const lines = lineCandidates[lineCandidates.length - 1] ?? [cleanedTitle];
+  return {
+    lines,
+    fontSize: fallbackFont,
+    lineHeight: Math.round(fallbackFont * 0.86),
+    blockHeight: fallbackFont + Math.max(0, lines.length - 1) * Math.round(fallbackFont * 0.86)
+  };
+}
+
+function svgDataUri(svg: string): Buffer {
+  return Buffer.from(svg);
+}
+
+function deleteGeneratedArtworkFile(artworkPath: string | null | undefined) {
+  if (!artworkPath) {
+    return;
+  }
+  const filePath = path.join(generatedArtworkDir, path.basename(artworkPath));
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
+}
+
+function pruneGeneratedArtworkFiles() {
+  const rows = db
+    .prepare("SELECT artwork_path FROM playlists WHERE artwork_path != ''")
+    .all() as Array<{ artwork_path: string }>;
+  const activeFiles = new Set(rows.map((row) => path.basename(row.artwork_path)).filter(Boolean));
+  for (const entry of fs.readdirSync(generatedArtworkDir)) {
+    if (activeFiles.has(entry)) {
+      continue;
+    }
+    const filePath = path.join(generatedArtworkDir, entry);
+    if (fs.statSync(filePath).isFile()) {
+      fs.unlinkSync(filePath);
+    }
+  }
+}
+
+function hexToRgb(value: string) {
+  const normalized = value.replace("#", "").trim();
+  return {
+    r: Number.parseInt(normalized.slice(0, 2), 16),
+    g: Number.parseInt(normalized.slice(2, 4), 16),
+    b: Number.parseInt(normalized.slice(4, 6), 16)
+  };
+}
+
+function fitSimpleTitleLayout(lines: string[]) {
+  const maxWidth = 1080;
+  const maxHeight = 1080;
+  for (let fontSize = 260; fontSize >= 56; fontSize -= 2) {
+    const longest = Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)));
+    const lineHeight = Math.round(fontSize * 0.84);
+    const blockHeight = fontSize + Math.max(0, lines.length - 1) * lineHeight;
+    if (longest <= maxWidth && blockHeight <= maxHeight) {
+      return { fontSize, lineHeight, blockHeight };
+    }
+  }
+  return { fontSize: 56, lineHeight: Math.round(56 * 0.84), blockHeight: 56 + Math.max(0, lines.length - 1) * Math.round(56 * 0.84) };
+}
+
+async function renderArtworkTitleOverlay(lines: string[]) {
+  const safeLines = lines.length ? lines : ["Untitled", "Playlist"];
+  const layout = fitSimpleTitleLayout(safeLines);
+  const firstBaseline = (1200 - layout.blockHeight) / 2 + layout.fontSize;
+  const leftInset = 72;
+  const svg = `
+    <svg width="1200" height="1200" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg">
+      ${safeLines
+        .map(
+          (line, index) =>
+            `<text x="${leftInset}" y="${firstBaseline + index * layout.lineHeight}" text-anchor="start" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="${layout.fontSize}" font-weight="900" letter-spacing="-1.8" fill="#ffffff">${escapeXml(line)}</text>`
+        )
+        .join("")}
+    </svg>
+  `;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+function paletteFromSeed(seed: string) {
+  const palettes = [
+    { dark: "#5a8f73", light: "#d8ece1", shadow: "#0f1016" },
+    { dark: "#b98a26", light: "#fff4c9", shadow: "#151118" },
+    { dark: "#8d6aa9", light: "#e9dcff", shadow: "#111018" },
+    { dark: "#4f7d96", light: "#dfefff", shadow: "#0d1118" },
+    { dark: "#a96d82", light: "#ffe3ef", shadow: "#161017" },
+    { dark: "#7d9b58", light: "#eef8da", shadow: "#101411" },
+    { dark: "#b47357", light: "#ffe4d5", shadow: "#18110f" },
+    { dark: "#567cae", light: "#e2eaff", shadow: "#0d1018" },
+    { dark: "#8f7b47", light: "#fff1ba", shadow: "#15130f" },
+    { dark: "#7a5b8d", light: "#f1defd", shadow: "#120f17" }
+  ] as const;
+  const index = Number.parseInt(seed.slice(0, 8), 16) % palettes.length;
+  return palettes[index] ?? palettes[0];
+}
+
+function playlistArtworkQueries(_name: string, _description: string, _artists: string[]): string[] {
+  return ["abstract"];
+}
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
+async function fetchBuffer(url: string, init?: RequestInit): Promise<Buffer> {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`);
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function isUsableArtworkImage(imageUrl: string): Promise<boolean> {
+  try {
+    if (lastFmPlaceholderImageFragments.some((fragment) => imageUrl.includes(fragment))) {
+      return false;
+    }
+    const source = await fetchBuffer(imageUrl, { signal: AbortSignal.timeout(8000) });
+    const image = sharp(source, { failOn: "none" });
+    const metadata = await image.metadata();
+    if (!metadata.width || !metadata.height || metadata.width < 300 || metadata.height < 300) {
+      return false;
+    }
+    const stats = await image.stats();
+    const meanSpread =
+      Math.abs(stats.channels[0]?.mean - stats.channels[1]?.mean)
+      + Math.abs(stats.channels[1]?.mean - stats.channels[2]?.mean)
+      + Math.abs(stats.channels[0]?.mean - stats.channels[2]?.mean);
+    const luminanceRange =
+      Math.max(stats.channels[0]?.max ?? 0, stats.channels[1]?.max ?? 0, stats.channels[2]?.max ?? 0)
+      - Math.min(stats.channels[0]?.min ?? 255, stats.channels[1]?.min ?? 255, stats.channels[2]?.min ?? 255);
+    const averageMean = ((stats.channels[0]?.mean ?? 0) + (stats.channels[1]?.mean ?? 0) + (stats.channels[2]?.mean ?? 0)) / 3;
+    const averageStdev = ((stats.channels[0]?.stdev ?? 0) + (stats.channels[1]?.stdev ?? 0) + (stats.channels[2]?.stdev ?? 0)) / 3;
+    if ((luminanceRange < 18 && meanSpread < 12) || (averageMean > 205 && averageStdev < 18)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchPexelsPhoto(queries: string[], signature: string, apiKey: string) {
+  const photoShape = {
+    url: "",
+    photographer: "",
+    src: {} as { large2x?: string; large?: string; original?: string },
+    avg_color: ""
+  };
+  for (const [attempt, query] of queries.entries()) {
+    const page = (Number.parseInt(signature.slice(0, 6), 16) % 5) + 1 + attempt;
+    const perPage = 12;
+    const url = new URL("https://api.pexels.com/v1/search");
+    url.searchParams.set("query", query);
+    url.searchParams.set("orientation", "square");
+    url.searchParams.set("size", "large");
+    url.searchParams.set("page", String(((page - 1) % 10) + 1));
+    url.searchParams.set("per_page", String(perPage));
+    const payload = await fetchJson<{
+      photos?: Array<typeof photoShape>;
+    }>(url.toString(), {
+      headers: { Authorization: apiKey }
+    });
+    const photos = payload.photos ?? [];
+    if (!photos.length) {
+      continue;
+    }
+    const index = Number.parseInt(signature.slice(6, 12), 16) % photos.length;
+    return photos[index] ?? photos[0];
+  }
+  throw new Error(`No Pexels images found for queries: ${queries.join(" | ")}`);
+}
+
+async function renderPlaylistArtwork(title: string, imageUrl: string, signature: string, averageColor?: string) {
+  void averageColor;
+  const palette = paletteFromSeed(signature);
+  const cleanTitle = dedupeAdjacentWords(title) || "Untitled Playlist";
+  const titleLines = cleanTitle.split(/\s+/).filter(Boolean);
+  const coverTitleLines = titleLines.length ? titleLines : ["Untitled", "Playlist"];
+  const source = await fetchBuffer(imageUrl);
+  const base = sharp(source).resize(1200, 1200, { fit: "cover", position: "attention" }).ensureAlpha();
+  const toneMap = await base
+    .clone()
+    .grayscale()
+    .normalize()
+    .linear(1.5, -36)
+    .gamma(1.12)
+    .raw()
+    .toBuffer();
+  const { r: darkR, g: darkG, b: darkB } = hexToRgb(palette.dark);
+  const { r: lightR, g: lightG, b: lightB } = hexToRgb(palette.light);
+  const mappedPixels = Buffer.alloc(1200 * 1200 * 4);
+  for (let index = 0; index < toneMap.length; index += 1) {
+    const luminance = Math.max(0, Math.min(1, toneMap[index] / 255));
+    const mappedLuminance = 0.05 + Math.pow(luminance, 1.38) * 0.32;
+    const offset = index * 4;
+    mappedPixels[offset] = Math.round(darkR + (lightR - darkR) * mappedLuminance);
+    mappedPixels[offset + 1] = Math.round(darkG + (lightG - darkG) * mappedLuminance);
+    mappedPixels[offset + 2] = Math.round(darkB + (lightB - darkB) * mappedLuminance);
+    mappedPixels[offset + 3] = 255;
+  }
+  const detailLayer = await base
+    .clone()
+    .grayscale()
+    .normalize()
+    .linear(1.18, -12)
+    .sharpen({ sigma: 1, m1: 1.2, m2: 2, x1: 2, y2: 10, y3: 16 })
+    .png()
+    .toBuffer();
+  const mappedImage = await sharp(mappedPixels, {
+    raw: {
+      width: 1200,
+      height: 1200,
+      channels: 4
+    }
+  })
+    .png()
+    .toBuffer();
+  const titleOverlay = await renderArtworkTitleOverlay(coverTitleLines);
+  return sharp({
+    create: {
+      width: 1200,
+      height: 1200,
+      channels: 4,
+      background: "#000000"
+    }
+  })
+    .composite([
+      { input: mappedImage, blend: "over" },
+      { input: detailLayer, blend: "overlay" },
+      {
+        input: await sharp({
+          create: {
+            width: 1200,
+            height: 1200,
+            channels: 4,
+            background: { r: 20, g: 12, b: 18, alpha: 0.18 }
+          }
+        }).png().toBuffer(),
+        blend: "multiply"
+      },
+      { input: titleOverlay, blend: "over" }
+    ])
+    .linear(0.96, -10)
+    .jpeg({ quality: 90, mozjpeg: true })
+    .toBuffer();
 }
 
 const namingFamilies = [
@@ -873,9 +1290,9 @@ function buildGeneratedPlaylistName(signatureTags: string[], audioVector: number
   const cleaned = name.replace(/\s+/g, " ").trim();
   if (cleaned.split(" ").length > 3) {
     const compact = `${adjective} ${noun}`;
-    return compact.replace(/\s+/g, " ").trim();
+    return dedupeAdjacentWords(compact.replace(/\s+/g, " ").trim());
   }
-  return cleaned;
+  return dedupeAdjacentWords(cleaned);
 }
 
 function buildMoodPlaylistName(moodName: string, signatureTags: string[], audioVector: number[], generationKey: string): string {
@@ -887,14 +1304,14 @@ function buildMoodPlaylistName(moodName: string, signatureTags: string[], audioV
     buildGeneratedPlaylistName(signatureTags, audioVector, `${generationKey}:mood-name:${moodName}`),
     `${moodName} ${pickWord(random, ["Drive", "Tide", "Signal"], "Signal")}`
   ];
-  return templates[Math.floor(random() * templates.length)] ?? `${moodName} Flow`;
+  return dedupeAdjacentWords(templates[Math.floor(random() * templates.length)] ?? `${moodName} Flow`);
 }
 
 function buildArtistPlaylistName(seedArtist: string, signatureTags: string[], audioVector: number[], generationKey: string): string {
   const seed = `${generationKey}:artist:${seedArtist}:${signatureTags.join("|")}:${audioVector.join("|")}`;
   const random = seededRandom(hashSeed(seed));
   const suffix = pickWord(random, ["Constellation", "Orbit", "Signal", "Axis", "Halo"], "Constellation");
-  return `${seedArtist} ${suffix}`;
+  return dedupeAdjacentWords(`${seedArtist} ${suffix}`);
 }
 
 function buildDiscoveryPlaylistName(signatureTags: string[], audioVector: number[], generationKey: string): string {
@@ -907,7 +1324,7 @@ function buildDiscoveryPlaylistName(signatureTags: string[], audioVector: number
     "Fresh Finds",
     "Deep Discovery"
   ];
-  return names[Math.floor(random() * names.length)] ?? "Discovery Mix";
+  return dedupeAdjacentWords(names[Math.floor(random() * names.length)] ?? "Discovery Mix");
 }
 
 function buildGeneratedPlaylistDescription(signatureTags: string[], audioVector: number[], source: PlaylistCandidate["source"]): string {
@@ -1137,6 +1554,188 @@ async function fetchLastFmTags(artist: string, title: string, album?: string | n
   };
 }
 
+async function fetchLastFmArtistSearchImage(artist: string): Promise<{ imageUrl: string; artistUrl: string } | null> {
+  const apiKey = settings.lastFmApiKey.trim();
+  const normalizedArtist = normalizeTag(artist);
+  if (!apiKey || !normalizedArtist) {
+    return null;
+  }
+  const params = new URLSearchParams({
+    method: "artist.search",
+    artist,
+    api_key: apiKey,
+    format: "json",
+    limit: "10"
+  });
+  try {
+    const response = await fetch(`https://ws.audioscrobbler.com/2.0/?${params.toString()}`, {
+      signal: AbortSignal.timeout(3500)
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json()) as {
+      results?: {
+        artistmatches?: {
+          artist?: Array<{
+            name?: string;
+            url?: string;
+            image?: Array<{ "#text"?: string; size?: string }>;
+            image_small?: string;
+          }> | {
+            name?: string;
+            url?: string;
+            image?: Array<{ "#text"?: string; size?: string }>;
+            image_small?: string;
+          };
+        };
+      };
+    };
+    const rawMatches = payload.results?.artistmatches?.artist;
+    const matches = Array.isArray(rawMatches) ? rawMatches : rawMatches ? [rawMatches] : [];
+    const sortedMatches = matches
+      .map((match) => ({
+        ...match,
+        normalizedName: normalizeTag(match.name ?? "")
+      }))
+      .sort((a, b) => {
+        const aExact = a.normalizedName === normalizedArtist ? 0 : 1;
+        const bExact = b.normalizedName === normalizedArtist ? 0 : 1;
+        return aExact - bExact;
+      });
+    for (const match of sortedMatches) {
+      const candidateUrls = [
+        ...((match.image ?? []).map((entry) => (entry["#text"] ?? "").trim()).filter(Boolean)),
+        (match.image_small ?? "").trim()
+      ].filter(Boolean);
+      for (const imageUrl of candidateUrls) {
+        if (await isUsableArtworkImage(imageUrl)) {
+          return {
+            imageUrl,
+            artistUrl: (match.url ?? "").trim()
+          };
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLastFmArtistImage(artist: string): Promise<{ imageUrl: string; artistUrl: string } | null> {
+  const apiKey = settings.lastFmApiKey.trim();
+  const normalizedArtist = normalizeTag(artist);
+  if (!apiKey || !normalizedArtist) {
+    return null;
+  }
+  if (lastFmArtistImageCache.has(normalizedArtist)) {
+    return lastFmArtistImageCache.get(normalizedArtist) ?? null;
+  }
+  const searchResult = await fetchLastFmArtistSearchImage(artist);
+  if (searchResult) {
+    lastFmArtistImageCache.set(normalizedArtist, searchResult);
+    return searchResult;
+  }
+  const params = new URLSearchParams({
+    method: "artist.getInfo",
+    artist,
+    api_key: apiKey,
+    format: "json",
+    autocorrect: "1"
+  });
+  try {
+    const response = await fetch(`https://ws.audioscrobbler.com/2.0/?${params.toString()}`, {
+      signal: AbortSignal.timeout(3500)
+    });
+    if (!response.ok) {
+      lastFmArtistImageCache.set(normalizedArtist, null);
+      return null;
+    }
+    const payload = (await response.json()) as {
+      artist?: {
+        url?: string;
+        image?: Array<{ "#text"?: string; size?: string }>;
+      };
+    };
+    const images = payload.artist?.image ?? [];
+    const preferredSizes = ["mega", "extralarge", "large", "medium", "small"];
+    const match = preferredSizes
+      .map((size) => images.find((image) => image.size === size && (image["#text"] ?? "").trim()))
+      .find(Boolean)
+      ?? images.find((image) => (image["#text"] ?? "").trim());
+    const imageUrl = (match?.["#text"] ?? "").trim();
+    const artistUrl = (payload.artist?.url ?? "").trim();
+    let result = imageUrl ? { imageUrl, artistUrl } : null;
+    if ((!result || !(await isUsableArtworkImage(result.imageUrl))) && artistUrl) {
+      const scrapedImageUrl = await fetchLastFmArtistPageImage(artistUrl);
+      if (scrapedImageUrl) {
+        result = { imageUrl: scrapedImageUrl, artistUrl };
+      }
+    }
+    lastFmArtistImageCache.set(normalizedArtist, result);
+    return result;
+  } catch {
+    lastFmArtistImageCache.set(normalizedArtist, null);
+    return null;
+  }
+}
+
+async function fetchLastFmArtistPageImage(artistUrl: string): Promise<string | null> {
+  try {
+    const pageUrls = [artistUrl, `${artistUrl.replace(/\/+$/, "")}/+images`];
+    const patterns = [
+      /<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/gi,
+      /<meta\s+content=["']([^"']+)["']\s+property=["']og:image["']/gi,
+      /<meta\s+name=["']twitter:image["']\s+content=["']([^"']+)["']/gi,
+      /<meta\s+content=["']([^"']+)["']\s+name=["']twitter:image["']/gi,
+      /https:\/\/lastfm\.freetls\.fastly\.net\/i\/u\/(?:34s|64s|174s|300x300|770x0|ar0|avatar170s)\/[a-zA-Z0-9._%-]+\.(?:png|jpg|jpeg)/gi
+    ];
+    for (const pageUrl of pageUrls) {
+      const response = await fetch(pageUrl, {
+        signal: AbortSignal.timeout(5000),
+        headers: {
+          "User-Agent": "Mozilla/5.0"
+        }
+      });
+      if (!response.ok) {
+        continue;
+      }
+      const html = await response.text();
+      for (const pattern of patterns) {
+        const matches = [...html.matchAll(pattern)];
+        for (const match of matches) {
+          const imageUrl = (match[1] ?? match[0] ?? "").trim();
+          if (!imageUrl || lastFmPlaceholderImageFragments.some((fragment) => imageUrl.includes(fragment))) {
+            continue;
+          }
+          if (await isUsableArtworkImage(imageUrl)) {
+            return imageUrl;
+          }
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function artistNameForArtistSignalPlaylist(playlist: PlaylistRecord, description: string, title: string): string | null {
+  if (!playlist.slug.startsWith("artist-")) {
+    return null;
+  }
+  const descriptionMatch = description.match(/sharing signature tags with\s+(.+)$/i);
+  if (descriptionMatch?.[1]?.trim()) {
+    return descriptionMatch[1].trim();
+  }
+  const titleMatch = title.match(/^(.*)\s+(Constellation|Orbit|Signal|Axis|Halo)$/i);
+  if (titleMatch?.[1]?.trim()) {
+    return titleMatch[1].trim();
+  }
+  return null;
+}
+
 async function fetchMusicBrainzArtistTags(artistMbid: string): Promise<string[]> {
   if (!artistMbid) {
     return [];
@@ -1250,18 +1849,27 @@ function clampUnit(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
-function buildSubsonicQuery(connection: SubsonicConnection, params: Record<string, string> = {}, includeFormat = true) {
+function buildSubsonicQuery(connection: SubsonicConnection, params: SubsonicQueryParams = {}, includeFormat = true) {
   const salt = randomUUID().replace(/-/g, "").slice(0, 12);
   const token = createHash("md5").update(`${connection.password}${salt}`).digest("hex");
-  return new URLSearchParams({
+  const query = new URLSearchParams({
     u: connection.username,
     t: token,
     s: salt,
     v: "1.16.1",
     c: "sortify",
-    ...(includeFormat ? { f: "json" } : {}),
-    ...params
+    ...(includeFormat ? { f: "json" } : {})
   });
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value === "string") {
+      query.append(key, value);
+    } else {
+      for (const item of value) {
+        query.append(key, item);
+      }
+    }
+  }
+  return query;
 }
 
 function buildSubsonicStreamUrl(connection: SubsonicConnection, songId: string) {
@@ -1374,7 +1982,7 @@ function getSubsonicConnection(input: unknown): SubsonicConnection {
   return { baseUrl, username, password };
 }
 
-async function subsonicRequest<T>(connection: SubsonicConnection, endpoint: string, params: Record<string, string> = {}): Promise<T> {
+async function subsonicRequest<T>(connection: SubsonicConnection, endpoint: string, params: SubsonicQueryParams = {}): Promise<T> {
   const query = buildSubsonicQuery(connection, params);
   const response = await fetch(`${connection.baseUrl}/rest/${endpoint}?${query.toString()}`, {
     signal: AbortSignal.timeout(12000)
@@ -1393,6 +2001,46 @@ async function subsonicRequest<T>(connection: SubsonicConnection, endpoint: stri
     throw new Error(envelope?.error?.message ?? "Subsonic API error");
   }
   return envelope as T;
+}
+
+async function navidromeLogin(connection: SubsonicConnection): Promise<string> {
+  const response = await fetch(`${connection.baseUrl}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: connection.username,
+      password: connection.password
+    }),
+    signal: AbortSignal.timeout(12_000)
+  });
+  const payload = (await response.json()) as { token?: string; error?: string };
+  if (!response.ok || !payload.token) {
+    throw new Error(payload.error ?? "Navidrome login failed");
+  }
+  return payload.token;
+}
+
+async function uploadNavidromePlaylistArtwork(
+  connection: SubsonicConnection,
+  playlistId: string,
+  token: string,
+  image: Buffer,
+  fileName: string
+) {
+  const form = new FormData();
+  form.append("image", new Blob([new Uint8Array(image)], { type: "image/jpeg" }), fileName);
+  const response = await fetch(`${connection.baseUrl}/api/playlist/${encodeURIComponent(playlistId)}/image`, {
+    method: "POST",
+    headers: {
+      "X-ND-Authorization": `Bearer ${token}`
+    },
+    body: form,
+    signal: AbortSignal.timeout(20_000)
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(body || `Artwork upload failed: ${response.status}`);
+  }
 }
 
 async function fetchSubsonicSongs(connection: SubsonicConnection): Promise<SubsonicSong[]> {
@@ -2253,23 +2901,93 @@ function replacePlaylists(candidates: PlaylistCandidate[]) {
       });
     }
     const stalePlaylists = db
-      .prepare("SELECT id FROM playlists WHERE is_recommended = 0 AND mode = 'dynamic' AND selected = 0")
-      .all() as Array<{ id: number }>;
+      .prepare("SELECT id, artwork_path FROM playlists WHERE is_recommended = 0 AND mode = 'dynamic' AND selected = 0")
+      .all() as Array<{ id: number; artwork_path: string }>;
     for (const stale of stalePlaylists) {
+      deleteGeneratedArtworkFile(stale.artwork_path);
       deletePlaylistByIdStmt.run(stale.id);
     }
   });
   transaction(candidates);
+  pruneGeneratedArtworkFiles();
 }
 
 function managedSubsonicPlaylistName(playlist: PlaylistRecord): string {
   return playlist.name;
 }
 
+async function syncPlaylistArtwork(
+  connection: SubsonicConnection,
+  playlist: PlaylistRecord,
+  remoteId: string,
+  title: string,
+  description: string,
+  weeklyTrackIds: number[],
+  trackRows: Array<{ trackId: number; path: string; artist: string | null }>,
+  getNavidromeToken: () => Promise<string>
+) {
+  if (!remoteId || !weeklyTrackIds.length) {
+    return;
+  }
+  const signature = hashText(`${playlistArtworkRenderVersion}|${playlist.slug}|${title}|${playlist.mode}|${weeklyTrackIds.join(",")}`);
+  if (playlist.artwork_signature === signature && playlist.artwork_path) {
+    const currentFile = path.join(generatedArtworkDir, path.basename(playlist.artwork_path));
+    if (fs.existsSync(currentFile)) {
+      return;
+    }
+  }
+  const artists = [...new Set(trackRows.map((row) => row.artist?.trim()).filter((value): value is string => Boolean(value)))];
+  const sourceArtist = artistNameForArtistSignalPlaylist(playlist, description, title);
+  const lastFmArtistImage = sourceArtist ? await fetchLastFmArtistImage(sourceArtist) : null;
+  const pexelsApiKey = settings.pexelsApiKey.trim();
+  let imageUrl = "";
+  let artworkAttribution = "";
+  let artworkAttributionUrl = "";
+  let averageColor = "";
+  if (lastFmArtistImage?.imageUrl && (await isUsableArtworkImage(lastFmArtistImage.imageUrl))) {
+    imageUrl = lastFmArtistImage.imageUrl;
+    artworkAttribution = `Artist image for ${sourceArtist} via Last.fm`;
+    artworkAttributionUrl = lastFmArtistImage.artistUrl || "https://www.last.fm/api/show/artist.getInfo";
+  } else {
+    if (!pexelsApiKey) {
+      return;
+    }
+    const queries = playlistArtworkQueries(title, description, artists);
+    const photo = await fetchPexelsPhoto(queries, signature, pexelsApiKey);
+    imageUrl = photo.src.large2x ?? photo.src.large ?? photo.src.original ?? "";
+    if (!imageUrl) {
+      throw new Error("Pexels photo is missing an image source");
+    }
+    artworkAttribution = `Photo by ${photo.photographer} on Pexels`;
+    artworkAttributionUrl = photo.url;
+    averageColor = photo.avg_color;
+  }
+  const rendered = await renderPlaylistArtwork(title, imageUrl, signature, averageColor);
+  const fileName = `${sanitizeFilename(playlist.slug)}-${signature.slice(0, 12)}.jpg`;
+  const localPath = path.join(generatedArtworkDir, fileName);
+  fs.writeFileSync(localPath, rendered);
+  await uploadNavidromePlaylistArtwork(connection, remoteId, await getNavidromeToken(), rendered, fileName);
+  updatePlaylistArtworkStmt.run({
+    id: playlist.id,
+    artwork_path: `/generated-artwork/${fileName}`,
+    artwork_attribution: artworkAttribution,
+    artwork_attribution_url: artworkAttributionUrl,
+    artwork_signature: signature,
+    artwork_updated_at: new Date().toISOString()
+  });
+  if (playlist.artwork_path && playlist.artwork_path !== `/generated-artwork/${fileName}`) {
+    const previousFile = path.join(generatedArtworkDir, path.basename(playlist.artwork_path));
+    if (fs.existsSync(previousFile)) {
+      fs.unlinkSync(previousFile);
+    }
+  }
+}
+
 async function syncSubsonicPlaylists(connection: SubsonicConnection) {
   const managedPlaylists = db
     .prepare(
-      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at
+      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at,
+              artwork_path, artwork_attribution, artwork_attribution_url, artwork_signature, artwork_updated_at
        FROM playlists
        WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')
        ORDER BY CASE mode WHEN 'locked' THEN 0 WHEN 'pinned' THEN 1 ELSE 2 END, name`
@@ -2286,6 +3004,11 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
   let applied = 0;
   let removed = 0;
   const weekKey = isoWeekKey();
+  let navidromeTokenPromise: Promise<string> | null = null;
+  const getNavidromeToken = () => {
+    navidromeTokenPromise ??= navidromeLogin(connection);
+    return navidromeTokenPromise;
+  };
   const previousManagedNames = new Set(previousRecommendedPlaylistNamesBySlug.values());
   for (const playlist of managedPlaylists) {
     const trackRows = db
@@ -2354,9 +3077,10 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
     });
     const entries = detail.playlist?.entry ?? [];
     if (entries.length) {
-      const removeParams: Record<string, string> = { playlistId: remoteId };
-      removeParams.songIndexToRemove = entries.map((_, index) => String(entries.length - 1 - index)).join(",");
-      await subsonicRequest(connection, "updatePlaylist.view", removeParams);
+      await subsonicRequest(connection, "updatePlaylist.view", {
+        playlistId: remoteId,
+        songIndexToRemove: entries.map((_, index) => String(entries.length - 1 - index))
+      });
     }
     if (!songIds.length) {
       appendLog({
@@ -2368,6 +3092,30 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
     }
     for (const songId of songIds) {
       await subsonicRequest(connection, "updatePlaylist.view", { playlistId: remoteId, songIdToAdd: songId });
+    }
+    if (playlist.mode !== "locked") {
+      try {
+        await syncPlaylistArtwork(
+          connection,
+          playlist,
+          remoteId,
+          targetName,
+          playlist.description ?? "",
+          weeklyTrackIds,
+          trackRows,
+          getNavidromeToken
+        );
+      } catch (error) {
+        appendLog({
+          level: "warn",
+          scope: "playlist",
+          message: "Playlist artwork refresh failed",
+          meta: {
+            name: targetName,
+            error: error instanceof Error ? error.message : "Unknown artwork error"
+          }
+        });
+      }
     }
     applied += 1;
   }
@@ -2570,6 +3318,8 @@ function settingsSnapshot() {
     hasNavidromePassword: Boolean(settings.navidromePassword),
     lastFmApiKey: "",
     hasLastFmApiKey: Boolean(settings.lastFmApiKey),
+    pexelsApiKey: "",
+    hasPexelsApiKey: Boolean(settings.pexelsApiKey),
     weeklyPlaylistCount: settings.weeklyPlaylistCount,
     maxTracksPerPlaylist: settings.maxTracksPerPlaylist
   };
@@ -2596,6 +3346,9 @@ app.patch("/api/settings", (req, res) => {
   }
   if (body.lastFmApiKey !== undefined) {
     settings.lastFmApiKey = String(body.lastFmApiKey ?? "").trim();
+  }
+  if (body.pexelsApiKey !== undefined) {
+    settings.pexelsApiKey = String(body.pexelsApiKey ?? "").trim();
   }
   if (body.weeklyPlaylistCount !== undefined) {
     settings.weeklyPlaylistCount = clamp(Number(body.weeklyPlaylistCount), 1, 5);
@@ -2847,7 +3600,8 @@ app.post("/api/playlists/generate", async (req, res) => {
 app.get("/api/playlists", (_req, res) => {
   const playlists = db
     .prepare(
-      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at
+      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at,
+              artwork_path, artwork_attribution, artwork_attribution_url, artwork_signature, artwork_updated_at
        FROM playlists
        WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')
        ORDER BY CASE mode WHEN 'locked' THEN 0 WHEN 'pinned' THEN 1 ELSE 2 END, name ASC`
@@ -2865,6 +3619,9 @@ app.get("/api/playlists", (_req, res) => {
       .all(playlist.id);
     return {
       ...playlist,
+      artworkUrl: playlist.artwork_path || null,
+      artworkAttribution: playlist.artwork_attribution || null,
+      artworkAttributionUrl: playlist.artwork_attribution_url || null,
       tracks
     };
   });
