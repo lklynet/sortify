@@ -119,3 +119,4 @@ export async function fetchMusicBrainzTags(artist: string, title: string, cache:
     log.warn("musicbrainz recording fetch failed", { artist, title });
     return { recordingTags: [], artistTags: [], year: null };
   }
+}
