@@ -79,11 +79,6 @@ def summarize(audio: np.ndarray, sample_rate: int) -> dict:
     centroid = np.sum(spectra * freqs, axis=1) / np.sum(spectra, axis=1)
     brightness = clamp_unit((float(np.median(centroid)) - 350.0) / 2800.0)
 
-    cumulative = np.cumsum(spectra, axis=1)
-    thresholds = cumulative[:, -1:] * 0.85
-    rolloff_indices = np.argmax(cumulative >= thresholds, axis=1)
-    rolloff_freq = freqs[np.clip(rolloff_indices, 0, freqs.size - 1)]
-
     flatness = np.exp(np.mean(np.log(spectra), axis=1)) / np.mean(spectra, axis=1)
     flatness_value = clamp_unit(float(np.median(flatness)) * 3.0)
 
@@ -165,9 +160,7 @@ def summarize(audio: np.ndarray, sample_rate: int) -> dict:
             "brightness": round(brightness, 4),
             "rhythmicDensity": round(rhythmic_density, 4),
             "loudness": round(loudness, 4),
-            "moodTags": ordered_tags[:12],
-            "spectralRolloff": round(clamp_unit(float(np.median(rolloff_freq)) / 5000.0), 4),
-            "periodicity": round(periodicity, 4)
+            "moodTags": ordered_tags[:12]
         },
         "vector": [round(clamp_unit(value), 4) for value in vector]
     }

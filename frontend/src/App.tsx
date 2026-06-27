@@ -48,7 +48,6 @@ type Track = {
 };
 type WorkerState = {
   running: boolean;
-  cycleRunning: boolean;
   weeklyPlaylistCount: number;
   lastRunAt: string | null;
   lastRunWeek: string | null;
@@ -63,8 +62,6 @@ type Settings = {
   hasNavidromePassword: boolean;
   lastFmApiKey: string;
   hasLastFmApiKey: boolean;
-  pexelsApiKey: string;
-  hasPexelsApiKey: boolean;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
 };
@@ -140,8 +137,6 @@ function App() {
     hasNavidromePassword: false,
     lastFmApiKey: "",
     hasLastFmApiKey: false,
-    pexelsApiKey: "",
-    hasPexelsApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
   });
@@ -152,8 +147,6 @@ function App() {
     hasNavidromePassword: false,
     lastFmApiKey: "",
     hasLastFmApiKey: false,
-    pexelsApiKey: "",
-    hasPexelsApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20
   });
@@ -182,16 +175,13 @@ function App() {
     }),
     [settingsDraft.hasLastFmApiKey, settingsDraft.lastFmApiKey]
   );
-  const artworkStatus = Boolean(settingsDraft.pexelsApiKey.trim() || settingsDraft.hasPexelsApiKey);
   const mergeSettingsDraft = useCallback(
     (nextSettings: Settings, currentDraft: Settings) => ({
       ...nextSettings,
       navidromePassword: currentDraft.navidromePassword,
       lastFmApiKey: currentDraft.lastFmApiKey,
-      pexelsApiKey: currentDraft.pexelsApiKey,
       hasNavidromePassword: nextSettings.hasNavidromePassword || currentDraft.navidromePassword.trim().length > 0,
-      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0,
-      hasPexelsApiKey: nextSettings.hasPexelsApiKey || currentDraft.pexelsApiKey.trim().length > 0
+      hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0
     }),
     []
   );
@@ -207,9 +197,6 @@ function App() {
     }
     if (settingsDraft.lastFmApiKey.trim()) {
       nextSettings.lastFmApiKey = settingsDraft.lastFmApiKey.trim();
-    }
-    if (settingsDraft.pexelsApiKey.trim()) {
-      nextSettings.pexelsApiKey = settingsDraft.pexelsApiKey.trim();
     }
     return nextSettings;
   }, [settingsDraft]);
@@ -509,19 +496,6 @@ function App() {
                       placeholder={settingsDraft.hasLastFmApiKey ? "****************" : "enter Last.fm key"}
                     />
                   </div>
-                  <div className="field">
-                    <label htmlFor="pexelsApiKey">Pexels API Key</label>
-                    <input
-                      id="pexelsApiKey"
-                      type="password"
-                      value={settingsDraft.pexelsApiKey}
-                      onChange={(event) => {
-                        setSettingsDraft((prev) => ({ ...prev, pexelsApiKey: event.target.value }));
-                        setSettingsDirty(true);
-                      }}
-                      placeholder={settingsDraft.hasPexelsApiKey ? "****************" : "enter Pexels key"}
-                    />
-                  </div>
                 </div>
               </section>
 
@@ -593,14 +567,13 @@ function App() {
           <div className="signal-row">
             <span className={`signal ${hasSubsonicConnection ? "ok" : "bad"}`}>Navidrome {hasSubsonicConnection ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.lastfm ? "ok" : "warn"}`}>Last.fm {keyStatus.lastfm ? "Ready" : "Optional"}</span>
-            <span className={`signal ${artworkStatus ? "ok" : "warn"}`}>Pexels {artworkStatus ? "Ready" : "Optional"}</span>
             <span className={`signal ${stats.analyzedTracks ? "ok" : "warn"}`}>Analyzed {stats.analyzedTracks}/{stats.tracks}</span>
             <span className="signal neutral">Playlists/Week {settings.weeklyPlaylistCount}</span>
             <span className="signal neutral">Max Tracks {settings.maxTracksPerPlaylist}</span>
           </div>
           {worker ? (
             <p className="status">
-              Worker {worker.running ? "running" : "stopped"} · cycle {worker.cycleRunning ? "active" : "idle"} · next refresh{" "}
+              Worker {worker.running ? "running" : "stopped"} · next refresh{" "}
               {worker.nextRunAt ? new Date(worker.nextRunAt).toLocaleString() : "n/a"}
             </p>
           ) : null}
