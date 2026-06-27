@@ -1,5 +1,8 @@
 import sharp from "sharp";
 import { QuantizerCelebi, Score } from "@material/material-color-utilities";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("artwork");
 
 export function sanitizeFilename(value: string): string {
   return value
@@ -166,6 +169,7 @@ export async function isUsableArtworkImage(imageUrl: string): Promise<boolean> {
     }
     return true;
   } catch {
+    log.debug("artwork usability check failed", { imageUrl });
     return false;
   }
 }

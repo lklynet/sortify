@@ -19,7 +19,7 @@
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "dependencies": {
-    "@material/material-color-utilities": "^0.4.0",
+    "@material/material-color-utilities": "0.3.0",
     "@russellthehippo/honker-node": "^0.3.3",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",

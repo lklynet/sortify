@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("subsonic");
 
 export type SubsonicConnection = {
   baseUrl: string;
@@ -62,6 +65,7 @@ export async function subsonicRequest<T>(connection: SubsonicConnection, endpoin
     signal: AbortSignal.timeout(12000)
   });
   if (!response.ok) {
+    log.warn("subsonic request failed", { endpoint, status: response.status });
     throw new Error(`Subsonic request failed: ${response.status}`);
   }
   const payload = (await response.json()) as {
@@ -72,7 +76,9 @@ export async function subsonicRequest<T>(connection: SubsonicConnection, endpoin
   };
   const envelope = payload["subsonic-response"];
   if (!envelope || envelope.status !== "ok") {
-    throw new Error(envelope?.error?.message ?? "Subsonic API error");
+    const errMsg = envelope?.error?.message ?? "Subsonic API error";
+    log.warn("subsonic API error", { endpoint, error: errMsg });
+    throw new Error(errMsg);
   }
   return envelope as T;
 }
@@ -89,6 +95,7 @@ export async function navidromeLogin(connection: SubsonicConnection): Promise<st
   });
   const payload = (await response.json()) as { token?: string; error?: string };
   if (!response.ok || !payload.token) {
+    log.warn("navidrome login failed", { status: response.status, error: payload.error ?? "no token" });
     throw new Error(payload.error ?? "Navidrome login failed");
   }
   return payload.token;
@@ -113,6 +120,7 @@ export async function uploadNavidromePlaylistArtwork(
   });
   if (!response.ok) {
     const body = await response.text();
+    log.warn("artwork upload failed", { playlistId, status: response.status, error: body });
     throw new Error(body || `Artwork upload failed: ${response.status}`);
   }
 }
@@ -120,6 +128,7 @@ export async function uploadNavidromePlaylistArtwork(
 export async function fetchSubsonicSongs(connection: SubsonicConnection): Promise<SubsonicSong[]> {
   const songs: SubsonicSong[] = [];
   const pageSize = 500;
+  log.debug("fetching songs from subsonic", { baseUrl: connection.baseUrl });
   let offset = 0;
   while (true) {
     const list = await subsonicRequest<{ albumList2?: { album?: Array<{ id: string }> } }>(connection, "getAlbumList2.view", {
@@ -140,5 +149,6 @@ export async function fetchSubsonicSongs(connection: SubsonicConnection): Promis
     }
     offset += pageSize;
   }
+  log.debug("fetched songs from subsonic", { count: songs.length });
   return songs;
 }

@@ -1,4 +1,7 @@
 import { normalizeTag, uniqueTags } from "./tags.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("lastfm");
 
 async function fetchLastFmTagsFromApi(apiKey: string, params: URLSearchParams): Promise<string[]> {
   if (!apiKey) {
@@ -27,6 +30,7 @@ async function fetchLastFmTagsFromApi(apiKey: string, params: URLSearchParams): 
         .map((entry) => entry.name)
     );
   } catch {
+    log.warn("lastfm tags fetch failed", { method: params.get("method"), artist: params.get("artist"), track: params.get("track") });
     return [];
   }
 }
@@ -160,6 +164,7 @@ async function fetchLastFmArtistSearchImage(
     }
     return null;
   } catch {
+    log.warn("lastfm artist search failed", { artist });
     return null;
   }
 }
@@ -215,6 +220,7 @@ export async function fetchLastFmArtistImage(
     cache.set(normalizedArtist, result);
     return result;
   } catch {
+    log.warn("lastfm artist.getInfo failed", { artist });
     cache.set(normalizedArtist, null);
     return null;
   }

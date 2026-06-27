@@ -1,4 +1,7 @@
 import { uniqueTags } from "./tags.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("musicbrainz");
 
 type MusicBrainzTagResult = {
   recordingTags: string[];
@@ -39,6 +42,7 @@ async function fetchMusicBrainzArtistTags(cache: Map<string, string[]>, artistMb
     cache.set(artistMbid, tags);
     return tags;
   } catch {
+    log.warn("musicbrainz artist tags fetch failed", { artistMbid });
     cache.set(artistMbid, []);
     return [];
   }
@@ -75,6 +79,7 @@ export async function fetchMusicBrainzTags(artist: string, title: string, cache:
     };
     const recordings = payload.recordings ?? [];
     if (!recordings.length) {
+      log.debug("musicbrainz no recordings found", { artist, title });
       return { recordingTags: [], artistTags: [], year: null };
     }
     const rankedRecordings = [...recordings].sort((a, b) => {
@@ -111,6 +116,6 @@ export async function fetchMusicBrainzTags(artist: string, title: string, cache:
       year: Number.isNaN(year) ? null : year
     };
   } catch {
+    log.warn("musicbrainz recording fetch failed", { artist, title });
     return { recordingTags: [], artistTags: [], year: null };
   }
-}

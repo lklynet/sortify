@@ -1,4 +1,7 @@
 import honker from "@russellthehippo/honker-node";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("scheduler");
 
 let hdb: honker.Database | null = null;
 let scansQueue: honker.Queue | null = null;
@@ -14,6 +17,7 @@ export function bootstrap(dbPath: string): honker.Database {
     schedule: "0 0 * * 0",
     payload: {}
   });
+  log.info("scheduler initialized", { dbPath, schedule: "weekly sunday midnight" });
   return hdb;
 }
 

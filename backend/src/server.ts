@@ -14,6 +14,7 @@ import { renderPlaylistArtwork, isUsableArtworkImage, sanitizeFilename } from ".
 import { fetchLastFmTags, fetchLastFmArtistImage } from "./lastfm.js";
 import { fetchMusicBrainzTags } from "./musicbrainz.js";
 import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick } from "./scheduler.js";
+import { createLogger } from "./logger.js";
 
 type TrackRecord = {
   id: number;
@@ -148,6 +149,7 @@ const audioAnalysisEnabled = process.env.AUDIO_ANALYSIS_ENABLED !== "false";
 const audioAnalysisSampleSeconds = Math.max(30, Math.min(180, Number(process.env.AUDIO_ANALYSIS_SAMPLE_SECONDS ?? 90)));
 const audioAnalysisTimeoutMs = Math.max(10_000, Math.min(90_000, Number(process.env.AUDIO_ANALYSIS_TIMEOUT_MS ?? 25_000)));
 const encryptedSettingPrefix = "enc-v1";
+const log = createLogger("server");
 const scanJobs = new Map<string, ScanProgress>();
 const operationLogs: OperationLogEntry[] = [];
 let activeScanJobId: string | null = null;
@@ -343,6 +345,7 @@ if (!hasColumn("artwork_updated_at")) {
 db.exec("UPDATE playlists SET mode = 'locked' WHERE mode = 'frozen'");
 db.exec("UPDATE playlists SET mode = 'dynamic' WHERE mode NOT IN ('dynamic', 'pinned', 'locked')");
 db.exec("UPDATE playlists SET updated_at = CASE WHEN updated_at = '' THEN created_at ELSE updated_at END");
+log.info("database initialized", { dbFile: dbFile });
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -481,6 +484,7 @@ function persistSettings() {
 }
 
 loadPersistedSettings();
+log.info("settings loaded", { navidromeConfigured: Boolean(settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword), workerRunning: workerState.running });
 
 function syncWorkerConnectionFromSettings() {
   if (settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword) {
@@ -1708,8 +1712,9 @@ if (frontendDistDir) {
 }
 
 bootstrapScheduler(dbFile);
+log.info("scheduler bootstrapped");
 resumeWorkerSchedulerFromPersistence();
 
 app.listen(port, () => {
-  console.log(`Sortify backend listening on http://localhost:${port}`);
+  log.info("server started", { port, dbFile, frontendDistDir: frontendDistDir ?? "none" });
 });
