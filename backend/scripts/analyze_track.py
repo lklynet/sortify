@@ -40,6 +40,53 @@ def load_audio(url: str, sample_seconds: int, sample_rate: int) -> np.ndarray:
     return audio / 32768.0
 
 
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+K_S_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88], dtype=np.float64)
+K_S_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17], dtype=np.float64)
+
+CAMELOT_MAJOR = {0: (8, "B"), 7: (9, "B"), 2: (10, "B"), 9: (11, "B"), 4: (12, "B"), 11: (1, "B"), 6: (2, "B"), 1: (3, "B"), 8: (4, "B"), 3: (5, "B"), 10: (6, "B"), 5: (7, "B")}
+CAMELOT_MINOR = {9: (8, "A"), 4: (9, "A"), 11: (10, "A"), 6: (11, "A"), 1: (12, "A"), 8: (1, "A"), 3: (2, "A"), 10: (3, "A"), 5: (4, "A"), 0: (5, "A"), 7: (6, "A"), 2: (7, "A")}
+
+
+def compute_chromagram(spectra: np.ndarray, freqs: np.ndarray) -> np.ndarray:
+    chroma = np.zeros((spectra.shape[0], 12), dtype=np.float64)
+    for i, f in enumerate(freqs):
+        if f < 65.0 or i >= spectra.shape[1]:
+            continue
+        midi = 69.0 + 12.0 * math.log2(f / 440.0)
+        pitch_class = int(round(midi)) % 12
+        chroma[:, pitch_class] += spectra[:, i]
+    row_sums = chroma.sum(axis=1, keepdims=True) + 1e-9
+    return chroma / row_sums
+
+
+def estimate_key(chromagram: np.ndarray) -> tuple[str | None, int | None, str | None, float]:
+    mean_chroma = chromagram.mean(axis=0)
+    if mean_chroma.sum() < 1e-6:
+        return None, None, None, 0.0
+    mean_chroma = mean_chroma / (mean_chroma.sum() + 1e-9)
+    scores = []
+    for tonic in range(12):
+        rotated_major = np.roll(K_S_MAJOR, tonic)
+        rotated_minor = np.roll(K_S_MINOR, tonic)
+        corr_major = float(np.corrcoef(mean_chroma, rotated_major)[0, 1]) if mean_chroma.std() > 1e-9 else 0.0
+        corr_minor = float(np.corrcoef(mean_chroma, rotated_minor)[0, 1]) if mean_chroma.std() > 1e-9 else 0.0
+        scores.append((corr_major, tonic, "major"))
+        scores.append((corr_minor, tonic, "minor"))
+    scores.sort(key=lambda x: x[0], reverse=True)
+    best_corr, best_tonic, best_mode = scores[0]
+    mean_corr = sum(s[0] for s in scores) / len(scores)
+    std_corr = float(np.std([s[0] for s in scores]))
+    confidence = clamp_unit((best_corr - mean_corr) / (std_corr + 1e-9) * 2.5) if std_corr > 1e-9 else 0.0
+    if best_corr < 0.15:
+        return None, None, None, 0.0
+    key_name = f"{NOTE_NAMES[best_tonic]} {best_mode}"
+    camelot_entry = CAMELOT_MAJOR[best_tonic] if best_mode == "major" else CAMELOT_MINOR[best_tonic]
+    camelot = f"{camelot_entry[0]}{camelot_entry[1]}"
+    return key_name, best_tonic, camelot, confidence
+
+
 def estimate_tempo(onset_envelope: np.ndarray, sample_rate: int, hop_length: int) -> tuple[float | None, float]:
     if onset_envelope.size < 16:
         return None, 0.0
@@ -91,6 +138,9 @@ def summarize(audio: np.ndarray, sample_rate: int) -> dict:
     bpm, periodicity = estimate_tempo(onset_envelope, sample_rate, hop_length)
     rhythmic_density = clamp_unit(float(np.mean(onset_envelope)) * 12.0)
 
+    chromagram = compute_chromagram(spectra, freqs)
+    key_name, key_tonic, camelot_key, key_confidence = estimate_key(chromagram)
+
     tempo_norm = clamp_unit(((bpm or 110.0) - 70.0) / 90.0)
     danceability = clamp_unit((energy * 0.4) + (tempo_norm * 0.25) + (periodicity * 0.25) + (rhythmic_density * 0.1))
     acousticness = clamp_unit(1.0 - ((brightness * 0.28) + (flatness_value * 0.3) + (zcr_value * 0.22) + (energy * 0.2)))
@@ -127,6 +177,11 @@ def summarize(audio: np.ndarray, sample_rate: int) -> dict:
         mood_tags.append("rhythmic")
     if instrumentalness > 0.62:
         mood_tags.append("textural")
+    if key_name:
+        if "minor" in key_name:
+            mood_tags.extend(["minor key", "dark", "melancholic"])
+        else:
+            mood_tags.extend(["major key", "bright"])
 
     ordered_tags: list[str] = []
     seen: set[str] = set()
@@ -149,7 +204,7 @@ def summarize(audio: np.ndarray, sample_rate: int) -> dict:
 
     return {
         "features": {
-            "version": "audio-v1",
+            "version": "audio-v2",
             "durationSampled": int(round(audio.size / sample_rate)),
             "bpm": None if bpm is None else round(float(bpm), 2),
             "energy": round(energy, 4),
@@ -160,6 +215,9 @@ def summarize(audio: np.ndarray, sample_rate: int) -> dict:
             "brightness": round(brightness, 4),
             "rhythmicDensity": round(rhythmic_density, 4),
             "loudness": round(loudness, 4),
+            "key": key_name,
+            "keyConfidence": round(key_confidence, 4),
+            "camelotKey": camelot_key,
             "moodTags": ordered_tags[:12]
         },
         "vector": [round(clamp_unit(value), 4) for value in vector]

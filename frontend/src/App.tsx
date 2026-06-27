@@ -36,6 +36,16 @@ type Playlist = {
   artworkAttributionUrl: string | null;
   tracks: Array<{ id: number; title: string; artist: string; album: string; path: string }>;
 };
+type Snapshot = {
+  id: number;
+  playlistId: number;
+  slug: string;
+  name: string;
+  trackIds: number[];
+  trackCount: number;
+  snapshotWeek: string;
+  createdAt: string;
+};
 type Track = {
   id: number;
   title: string;
@@ -155,6 +165,8 @@ function App() {
   const [logs, setLogs] = useState<OperationLog[]>([]);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [playlistTab, setPlaylistTab] = useState<"playlists" | "history">("playlists");
   const [worker, setWorker] = useState<WorkerState | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -212,15 +224,17 @@ function App() {
   }, [settingsDraft.navidromePassword, settingsDraft.navidromeUrl, settingsDraft.navidromeUsername]);
 
   const loadDashboardData = useCallback(async () => {
-    const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedWorker, fetchedSettings] = await Promise.all([
+    const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedSnapshots, fetchedWorker, fetchedSettings] = await Promise.all([
       callApi<Stats>("/api/stats"),
       callApi<Track[]>("/api/tracks?limit=20"),
       callApi<Playlist[]>("/api/playlists"),
+      callApi<Snapshot[]>("/api/playlists/snapshots"),
       callApi<WorkerState>("/api/worker"),
       callApi<Settings>("/api/settings")
     ]);
     setStats(fetchedStats);
     setTracks(fetchedTracks);
+    setSnapshots(fetchedSnapshots);
     setPlaylists((currentPlaylists) => {
       if (playlistReorderOnNextLoadRef.current || !currentPlaylists.length) {
         playlistReorderOnNextLoadRef.current = false;
@@ -510,11 +524,11 @@ function App() {
                       id="weeklyPlaylistCount"
                       value={settingsDraft.weeklyPlaylistCount}
                       onChange={(event) => {
-                        setSettingsDraft((prev) => ({ ...prev, weeklyPlaylistCount: Math.max(1, Math.min(5, Number(event.target.value))) }));
+                        setSettingsDraft((prev) => ({ ...prev, weeklyPlaylistCount: Math.max(1, Math.min(8, Number(event.target.value))) }));
                         setSettingsDirty(true);
                       }}
                     >
-                      {[1, 2, 3, 4, 5].map((count) => (
+                      {[1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
                         <option key={count} value={count}>
                           {count}
                         </option>
@@ -647,8 +661,19 @@ function App() {
 
         <article className="panel">
           <div className="panel-header panel-header-actions">
-            <div>
-              <h3>Current playlists</h3>
+            <div className="panel-tabs">
+              <button
+                className={`tab ${playlistTab === "playlists" ? "active" : ""}`}
+                onClick={() => setPlaylistTab("playlists")}
+              >
+                Playlists
+              </button>
+              <button
+                className={`tab ${playlistTab === "history" ? "active" : ""}`}
+                onClick={() => setPlaylistTab("history")}
+              >
+                History
+              </button>
             </div>
             <button
               className="ghost-button icon-button"
@@ -661,6 +686,7 @@ function App() {
             </button>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
+            {playlistTab === "playlists" ? (
             <ul className="playlistList">
               {playlists.map((playlist) => (
                 <li key={playlist.id}>
@@ -716,6 +742,33 @@ function App() {
                 </li>
               ))}
             </ul>
+            ) : (
+            snapshots.length === 0 ? (
+              <p className="emptyState">No history yet. Old playlists will appear here after the next weekly refresh.</p>
+            ) : (
+            <ul className="playlistList">
+              {snapshots.map((s) => (
+                <li key={s.id}>
+                  <div className="playlistCard">
+                    <div className="playlistArtwork playlistArtworkFallback" aria-hidden="true">
+                      {s.name.slice(0, 1).toUpperCase()}
+                    </div>
+                    <div className="playlistBody">
+                      <div className="playlistTopRow">
+                        <div className="playlistHead">
+                          <strong>{s.name}</strong>
+                          <span className="snapshotMeta">
+                            Week {s.snapshotWeek} · {s.trackCount} tracks · {new Date(s.createdAt).toLocaleDateString()}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            )
+            )}
           </div>
         </article>
       </section>

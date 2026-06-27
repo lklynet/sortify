@@ -102,6 +102,9 @@ type AudioAnalysis = {
   brightness: number;
   rhythmicDensity: number;
   loudness: number;
+  key?: string | null;
+  keyConfidence?: number;
+  camelotKey?: string | null;
   moodTags: string[];
 };
 
@@ -144,7 +147,7 @@ const settingsKeyFile = process.env.SORTIFY_SETTINGS_KEY_FILE ?? path.resolve(pa
 const generatedArtworkDir = process.env.SORTIFY_ARTWORK_PATH ?? path.resolve(path.dirname(dbFile), "artwork");
 const playlistArtworkRenderVersion = "v18";
 const audioAnalysisScriptFile = path.resolve(serverDir, "../scripts/analyze_track.py");
-const audioAnalysisVersion = "audio-v1";
+const audioAnalysisVersion = "audio-v2";
 const audioAnalysisEnabled = process.env.AUDIO_ANALYSIS_ENABLED !== "false";
 const audioAnalysisSampleSeconds = Math.max(30, Math.min(180, Number(process.env.AUDIO_ANALYSIS_SAMPLE_SECONDS ?? 90)));
 const audioAnalysisTimeoutMs = Math.max(10_000, Math.min(90_000, Number(process.env.AUDIO_ANALYSIS_TIMEOUT_MS ?? 25_000)));
@@ -299,6 +302,17 @@ CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS playlist_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  playlist_id INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  track_ids_json TEXT NOT NULL,
+  snapshot_week TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_playlist_snapshots_playlist ON playlist_snapshots(playlist_id, snapshot_week);
 `);
 
 const trackColumns = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
@@ -420,6 +434,13 @@ const insertPlaylistTrackStmt = db.prepare(`
 INSERT INTO playlist_tracks (playlist_id, track_id, position)
 VALUES (?, ?, ?)
 `);
+const insertPlaylistSnapshotStmt = db.prepare(`
+INSERT INTO playlist_snapshots (playlist_id, slug, name, track_ids_json, snapshot_week, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+`);
+const readPlaylistTrackIdsStmt = db.prepare(`
+SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position
+`);
 const readAllSettingsStmt = db.prepare("SELECT key, value FROM app_settings");
 const upsertSettingStmt = db.prepare(`
 INSERT INTO app_settings (key, value)
@@ -448,7 +469,7 @@ function loadPersistedSettings() {
   }
   const weekly = Number.parseInt(read("weeklyPlaylistCount") ?? "", 10);
   if (!Number.isNaN(weekly)) {
-    settings.weeklyPlaylistCount = clamp(weekly, 1, 5);
+    settings.weeklyPlaylistCount = clamp(weekly, 1, 8);
   }
   const maxTracks = Number.parseInt(read("maxTracksPerPlaylist") ?? "", 10);
   if (!Number.isNaN(maxTracks)) {
@@ -743,6 +764,7 @@ async function scanLibrary(
     const title = song.title ?? "Unknown Title";
     const artist = song.artist ?? "Unknown Artist";
     const album = song.album ?? "Unknown Album";
+    const albumArtist = song.albumArtist ?? artist;
     const year = song.year ?? null;
     const duration = song.duration ?? null;
     const trackPath = `subsonic:${song.id}`;
@@ -783,7 +805,8 @@ async function scanLibrary(
         : null;
       const audioFeatures = analyzedAudio?.features ?? preservedAudio?.features ?? null;
       const audioVector = analyzedAudio?.vector ?? preservedAudio?.vector ?? [];
-      const baseTags = deriveBaseTags(title, artist, mergedYear, song.genre ? [song.genre] : [], audioFeatures?.bpm ?? null);
+      const rawGenres = song.genre ? song.genre.split(/[,;/|]+/).map((g) => g.trim()).filter(Boolean) : [];
+      const baseTags = deriveBaseTags(title, artist, mergedYear, rawGenres, audioFeatures?.bpm ?? null);
       const lastFmTags = await fetchLastFmTags(settings.lastFmApiKey, artist, title, album, { artistTags: lastFmArtistTagsCache, albumTags: lastFmAlbumTagsCache });
       const audioTags = audioFeatures?.moodTags ?? [];
       const tags = mergeRankedTagSources([
@@ -800,7 +823,7 @@ async function scanLibrary(
         title,
         artist,
         album,
-        album_artist: artist,
+        album_artist: albumArtist,
         year: mergedYear,
         duration,
         tags_json: JSON.stringify(tags),
@@ -904,6 +927,12 @@ function replacePlaylists(candidates: PlaylistCandidate[]) {
           is_recommended: 1
         });
         playlistId = Number(result.lastInsertRowid);
+      }
+      if (existing && existing.mode === "dynamic") {
+        const existingTrackIds = (readPlaylistTrackIdsStmt.all(playlistId) as Array<{ track_id: number }>).map((row) => row.track_id);
+        if (existingTrackIds.length > 0) {
+          insertPlaylistSnapshotStmt.run(playlistId, existing.slug, existing.name, JSON.stringify(existingTrackIds), isoWeekKey(), now);
+        }
       }
       deletePlaylistTracksByPlaylistIdStmt.run(playlistId);
       playlist.trackIds.forEach((trackId, position) => {
@@ -1159,12 +1188,13 @@ async function refreshRecommendedPlaylists(
     title: track.title,
     artist: track.artist,
     tags_json: track.tags_json,
+    audio_features_json: track.audio_features_json,
     audio_vector_json: track.audio_vector_json,
     play_count: track.play_count,
     favorite: track.favorite,
     tags: tagsFromTrack(track)
   }));
-  const leastPlayedRows = db.prepare("SELECT id, tags_json, audio_vector_json, play_count FROM tracks ORDER BY play_count ASC, RANDOM() LIMIT 160").all() as Array<{ id: number; tags_json: string; audio_vector_json: string; play_count: number }>;
+  const leastPlayedRows = db.prepare("SELECT id, tags_json, audio_features_json, audio_vector_json, play_count FROM tracks ORDER BY play_count ASC, RANDOM() LIMIT 160").all() as Array<{ id: number; tags_json: string; audio_features_json: string; audio_vector_json: string; play_count: number }>;
   const favoriteRows = db.prepare("SELECT id, tags_json FROM tracks WHERE favorite = 1 ORDER BY play_count DESC LIMIT 30").all() as Array<{ id: number; tags_json: string }>;
   const maxTracksPerPlaylist = settings.maxTracksPerPlaylist;
   const candidates = await generateCandidates({
@@ -1352,7 +1382,7 @@ app.patch("/api/settings", (req, res) => {
     settings.lastFmApiKey = String(body.lastFmApiKey ?? "").trim();
   }
   if (body.weeklyPlaylistCount !== undefined) {
-    settings.weeklyPlaylistCount = clamp(Number(body.weeklyPlaylistCount), 1, 5);
+    settings.weeklyPlaylistCount = clamp(Number(body.weeklyPlaylistCount), 1, 8);
     workerState.weeklyPlaylistCount = settings.weeklyPlaylistCount;
   }
   if (body.maxTracksPerPlaylist !== undefined) {
@@ -1418,7 +1448,7 @@ app.post("/api/worker/start", (req, res) => {
   }
   const requestedCount = Number(req.body?.weeklyPlaylistCount ?? workerState.weeklyPlaylistCount);
   workerConnection = connection;
-  workerState.weeklyPlaylistCount = clamp(requestedCount, 1, 5);
+  workerState.weeklyPlaylistCount = clamp(requestedCount, 1, 8);
   settings.weeklyPlaylistCount = workerState.weeklyPlaylistCount;
   settings.navidromeUrl = connection.baseUrl;
   settings.navidromeUsername = connection.username;
@@ -1594,7 +1624,7 @@ app.get("/api/scan/:id", (req, res) => {
 
 app.post("/api/playlists/generate", async (req, res) => {
   const requestedCount = Number(req.body?.weeklyPlaylistCount ?? workerState.weeklyPlaylistCount);
-  const count = clamp(requestedCount, 1, 5);
+  const count = clamp(requestedCount, 1, 8);
   const { candidates } = await refreshRecommendedPlaylists(count, randomUUID());
   res.json({ generated: candidates.length, playlists: candidates.map((item) => ({ name: item.name, tracks: item.trackIds.length })) });
 });
@@ -1628,6 +1658,39 @@ app.get("/api/playlists", (_req, res) => {
     };
   });
   res.json(response);
+});
+
+app.get("/api/playlists/snapshots", (_req, res) => {
+  const snapshots = db
+    .prepare(
+      `SELECT ps.id, ps.playlist_id, ps.slug, ps.name, ps.track_ids_json, ps.snapshot_week, ps.created_at,
+              COUNT(pt.track_id) as track_count
+       FROM playlist_snapshots ps
+       LEFT JOIN playlist_tracks pt ON pt.playlist_id = ps.playlist_id
+       WHERE ps.playlist_id IN (SELECT id FROM playlists WHERE is_recommended = 1 OR mode IN ('pinned', 'locked'))
+       GROUP BY ps.id
+       ORDER BY ps.created_at DESC
+       LIMIT 40`
+    )
+    .all() as Array<{ id: number; playlist_id: number; slug: string; name: string; track_ids_json: string; snapshot_week: string; created_at: string; track_count: number }>;
+  res.json(
+    snapshots.map((s) => {
+      let trackIds: number[] = [];
+      try {
+        trackIds = JSON.parse(s.track_ids_json) as number[];
+      } catch { /* empty */ }
+      return {
+        id: s.id,
+        playlistId: s.playlist_id,
+        slug: s.slug,
+        name: s.name,
+        trackIds,
+        trackCount: Array.isArray(trackIds) ? trackIds.length : s.track_count,
+        snapshotWeek: s.snapshot_week,
+        createdAt: s.created_at
+      };
+    })
+  );
 });
 
 app.patch("/api/playlists/:id", async (req, res) => {

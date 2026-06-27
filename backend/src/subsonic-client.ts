@@ -16,6 +16,7 @@ export type SubsonicSong = {
   title?: string;
   artist?: string;
   album?: string;
+  albumArtist?: string;
   year?: number;
   duration?: number;
   genre?: string;
