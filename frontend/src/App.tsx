@@ -13,6 +13,9 @@ type AudioFeatures = {
   brightness: number;
   rhythmicDensity: number;
   loudness: number;
+  key?: string | null;
+  keyConfidence?: number;
+  camelotKey?: string | null;
   moodTags: string[];
   durationSampled: number;
 };
@@ -62,6 +65,7 @@ type Track = {
   title: string;
   artist: string;
   album: string;
+  year: number | null;
   tags: string[];
   audioFeatures: AudioFeatures | null;
   audioVector: number[];
@@ -511,7 +515,7 @@ function App() {
       });
       setSavingFilterPlaylist(false);
       setFilterPlaylistName("");
-      const fetched = await callApi("/api/playlists");
+      const fetched = await callApi<Playlist[]>("/api/playlists");
       if (fetched) setPlaylists(fetched);
     });
 
