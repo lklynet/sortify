@@ -13,7 +13,7 @@ import { buildSubsonicStreamUrl, getSubsonicConnection, subsonicRequest, navidro
 import { renderPlaylistArtwork, isUsableArtworkImage, sanitizeFilename } from "./artwork-renderer.js";
 import { fetchLastFmTags, fetchLastFmArtistImage } from "./lastfm.js";
 import { fetchMusicBrainzTags } from "./musicbrainz.js";
-import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick } from "./scheduler.js";
+import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick, configureSchedule, CYCLE_FREQUENCIES } from "./scheduler.js";
 import { createLogger } from "./logger.js";
 
 type TrackRecord = {
@@ -79,6 +79,7 @@ type AppSettings = {
   lastFmApiKey: string;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
+  cycleFrequency: string;
 };
 
 type OperationLogEntry = {
@@ -173,7 +174,8 @@ const settings: AppSettings = {
   navidromePassword: defaultSubsonicPassword,
   lastFmApiKey: defaultLastFmApiKey,
   weeklyPlaylistCount: 3,
-  maxTracksPerPlaylist: defaultMaxTracksPerPlaylist
+  maxTracksPerPlaylist: defaultMaxTracksPerPlaylist,
+  cycleFrequency: "weekly"
 };
 
 function appendLog(entry: Omit<OperationLogEntry, "id" | "timestamp">) {
@@ -475,6 +477,10 @@ function loadPersistedSettings() {
   if (!Number.isNaN(maxTracks)) {
     settings.maxTracksPerPlaylist = clamp(maxTracks, 5, 100);
   }
+  const persistedCycleFrequency = read("cycleFrequency");
+  if (persistedCycleFrequency !== undefined && CYCLE_FREQUENCIES[persistedCycleFrequency]) {
+    settings.cycleFrequency = persistedCycleFrequency;
+  }
   const workerRunning = read("workerRunning");
   if (workerRunning !== undefined) {
     workerState.running = workerRunning === "true";
@@ -496,6 +502,7 @@ function persistSettings() {
     upsertSettingStmt.run("lastFmApiKey", encryptSettingValue(settings.lastFmApiKey));
     upsertSettingStmt.run("weeklyPlaylistCount", String(settings.weeklyPlaylistCount));
     upsertSettingStmt.run("maxTracksPerPlaylist", String(settings.maxTracksPerPlaylist));
+    upsertSettingStmt.run("cycleFrequency", settings.cycleFrequency);
     upsertSettingStmt.run("workerRunning", String(workerState.running));
     upsertSettingStmt.run("workerLastRunAt", workerState.lastRunAt ?? "");
     upsertSettingStmt.run("workerLastRunWeek", workerState.lastRunWeek ?? "");
@@ -1217,12 +1224,31 @@ async function refreshRecommendedPlaylists(
   return { candidates, sourceTracks: syncableTracks.length };
 }
 
-function nextWeekStartIso(now = new Date()): string {
+function nextRunFromFrequency(now = new Date()): Date {
   const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const day = date.getUTCDay() || 7;
-  date.setUTCDate(date.getUTCDate() + (8 - day));
   date.setUTCHours(0, 0, 0, 0);
-  return date.toISOString();
+  const freq = settings.cycleFrequency;
+  if (freq === "daily") {
+    date.setUTCDate(date.getUTCDate() + 1);
+  } else if (freq === "every-2-days") {
+    date.setUTCDate(date.getUTCDate() + 2);
+  } else if (freq === "twice-weekly") {
+    const day = date.getUTCDay();
+    if (day < 3) date.setUTCDate(date.getUTCDate() + (3 - day));
+    else if (day < 7) date.setUTCDate(date.getUTCDate() + (7 - day));
+    else date.setUTCDate(date.getUTCDate() + 3);
+  } else if (freq === "monthly") {
+    date.setUTCMonth(date.getUTCMonth() + 1);
+    date.setUTCDate(1);
+  } else {
+    const day = date.getUTCDay() || 7;
+    date.setUTCDate(date.getUTCDate() + (8 - day));
+  }
+  return date;
+}
+
+function nextWeekStartIso(now = new Date()): string {
+  return nextRunFromFrequency(now).toISOString();
 }
 
 function setWorkerScheduleHints() {
@@ -1355,7 +1381,8 @@ function settingsSnapshot() {
     lastFmApiKey: "",
     hasLastFmApiKey: Boolean(settings.lastFmApiKey),
     weeklyPlaylistCount: settings.weeklyPlaylistCount,
-    maxTracksPerPlaylist: settings.maxTracksPerPlaylist
+    maxTracksPerPlaylist: settings.maxTracksPerPlaylist,
+    cycleFrequency: settings.cycleFrequency
   };
 }
 
@@ -1387,6 +1414,13 @@ app.patch("/api/settings", (req, res) => {
   }
   if (body.maxTracksPerPlaylist !== undefined) {
     settings.maxTracksPerPlaylist = clamp(Number(body.maxTracksPerPlaylist), 5, 100);
+  }
+  if (body.cycleFrequency !== undefined) {
+    const freq = String(body.cycleFrequency ?? "").trim();
+    if (CYCLE_FREQUENCIES[freq]) {
+      settings.cycleFrequency = freq;
+      configureSchedule(settings.cycleFrequency);
+    }
   }
   syncWorkerConnectionFromSettings();
   if (workerState.running && !workerConnection) {
@@ -1774,8 +1808,8 @@ if (frontendDistDir) {
   });
 }
 
-bootstrapScheduler(dbFile);
-log.info("scheduler bootstrapped");
+bootstrapScheduler(dbFile, settings.cycleFrequency);
+log.info("scheduler bootstrapped", { cycleFrequency: settings.cycleFrequency });
 resumeWorkerSchedulerFromPersistence();
 
 app.listen(port, () => {

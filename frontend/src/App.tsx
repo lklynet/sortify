@@ -74,6 +74,7 @@ type Settings = {
   hasLastFmApiKey: boolean;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
+  cycleFrequency: string;
 };
 type ConfirmRefreshModal =
   | {
@@ -148,7 +149,8 @@ function App() {
     lastFmApiKey: "",
     hasLastFmApiKey: false,
     weeklyPlaylistCount: 3,
-    maxTracksPerPlaylist: 20
+    maxTracksPerPlaylist: 20,
+    cycleFrequency: "weekly"
   });
   const [settingsDraft, setSettingsDraft] = useState<Settings>({
     navidromeUrl: "",
@@ -158,7 +160,8 @@ function App() {
     lastFmApiKey: "",
     hasLastFmApiKey: false,
     weeklyPlaylistCount: 3,
-    maxTracksPerPlaylist: 20
+    maxTracksPerPlaylist: 20,
+    cycleFrequency: "weekly"
   });
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [stats, setStats] = useState<Stats>({ tracks: 0, playlists: 0, analyzedTracks: 0 });
@@ -202,7 +205,8 @@ function App() {
       navidromeUrl: settingsDraft.navidromeUrl.trim(),
       navidromeUsername: settingsDraft.navidromeUsername.trim(),
       weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount,
-      maxTracksPerPlaylist: settingsDraft.maxTracksPerPlaylist
+      maxTracksPerPlaylist: settingsDraft.maxTracksPerPlaylist,
+      cycleFrequency: settingsDraft.cycleFrequency
     };
     if (settingsDraft.navidromePassword.trim()) {
       nextSettings.navidromePassword = settingsDraft.navidromePassword.trim();
@@ -550,6 +554,23 @@ function App() {
                       }}
                     />
                   </div>
+                  <div className="field">
+                    <label htmlFor="cycleFrequency">Scan & playlist frequency</label>
+                    <select
+                      id="cycleFrequency"
+                      value={settingsDraft.cycleFrequency}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, cycleFrequency: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                    >
+                      <option value="daily">Daily</option>
+                      <option value="every-2-days">Every 2 days</option>
+                      <option value="twice-weekly">Twice weekly (Wed & Sun)</option>
+                      <option value="weekly">Weekly (Sunday)</option>
+                      <option value="monthly">Monthly (1st)</option>
+                    </select>
+                  </div>
                 </div>
               </section>
             </div>
@@ -582,6 +603,7 @@ function App() {
             <span className={`signal ${hasSubsonicConnection ? "ok" : "bad"}`}>Navidrome {hasSubsonicConnection ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.lastfm ? "ok" : "warn"}`}>Last.fm {keyStatus.lastfm ? "Ready" : "Optional"}</span>
             <span className={`signal ${stats.analyzedTracks ? "ok" : "warn"}`}>Analyzed {stats.analyzedTracks}/{stats.tracks}</span>
+            <span className="signal neutral">{settings.cycleFrequency === "daily" ? "Daily scan" : settings.cycleFrequency === "every-2-days" ? "Scan every 2d" : settings.cycleFrequency === "twice-weekly" ? "Scan 2x/week" : settings.cycleFrequency === "monthly" ? "Monthly scan" : "Scan weekly"}</span>
             <span className="signal neutral">Playlists/Week {settings.weeklyPlaylistCount}</span>
             <span className="signal neutral">Max Tracks {settings.maxTracksPerPlaylist}</span>
           </div>
