@@ -46,6 +46,17 @@ type Snapshot = {
   snapshotWeek: string;
   createdAt: string;
 };
+type LibraryStats = {
+  trackCount: number;
+  analyzedCount: number;
+  topTags: Array<{ tag: string; count: number }>;
+  audioDistributions: Record<string, number[]>;
+  keyDistribution: Array<{ key: string; count: number }>;
+  decadeSpread: Array<{ decade: string; count: number }>;
+  languageBreakdown: Array<{ language: string; count: number }>;
+  topGenres: Array<{ genre: string; count: number }>;
+  bpmStats: { min: number; max: number; avg: number; median: number };
+};
 type Track = {
   id: number;
   title: string;
@@ -64,6 +75,7 @@ type WorkerState = {
   nextRunAt: string | null;
   error: string | null;
   connectionConfigured: boolean;
+  cycleSchedule?: string;
 };
 type Settings = {
   navidromeUrl: string;
@@ -74,7 +86,7 @@ type Settings = {
   hasLastFmApiKey: boolean;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
-  cycleFrequency: string;
+  cycleSchedule: string;
 };
 type ConfirmRefreshModal =
   | {
@@ -150,7 +162,7 @@ function App() {
     hasLastFmApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20,
-    cycleFrequency: "weekly"
+    cycleSchedule: "weekly"
   });
   const [settingsDraft, setSettingsDraft] = useState<Settings>({
     navidromeUrl: "",
@@ -161,7 +173,7 @@ function App() {
     hasLastFmApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20,
-    cycleFrequency: "weekly"
+    cycleSchedule: "weekly"
   });
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [stats, setStats] = useState<Stats>({ tracks: 0, playlists: 0, analyzedTracks: 0 });
@@ -169,7 +181,8 @@ function App() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
-  const [playlistTab, setPlaylistTab] = useState<"playlists" | "history">("playlists");
+  const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
+  const [playlistTab, setPlaylistTab] = useState<"playlists" | "history" | "stats">("playlists");
   const [worker, setWorker] = useState<WorkerState | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -206,7 +219,7 @@ function App() {
       navidromeUsername: settingsDraft.navidromeUsername.trim(),
       weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount,
       maxTracksPerPlaylist: settingsDraft.maxTracksPerPlaylist,
-      cycleFrequency: settingsDraft.cycleFrequency
+      cycleSchedule: settingsDraft.cycleSchedule
     };
     if (settingsDraft.navidromePassword.trim()) {
       nextSettings.navidromePassword = settingsDraft.navidromePassword.trim();
@@ -228,17 +241,19 @@ function App() {
   }, [settingsDraft.navidromePassword, settingsDraft.navidromeUrl, settingsDraft.navidromeUsername]);
 
   const loadDashboardData = useCallback(async () => {
-    const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedSnapshots, fetchedWorker, fetchedSettings] = await Promise.all([
+    const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedSnapshots, fetchedLibraryStats, fetchedWorker, fetchedSettings] = await Promise.all([
       callApi<Stats>("/api/stats"),
       callApi<Track[]>("/api/tracks?limit=20"),
       callApi<Playlist[]>("/api/playlists"),
       callApi<Snapshot[]>("/api/playlists/snapshots"),
+      callApi<LibraryStats>("/api/stats/library"),
       callApi<WorkerState>("/api/worker"),
       callApi<Settings>("/api/settings")
     ]);
     setStats(fetchedStats);
     setTracks(fetchedTracks);
     setSnapshots(fetchedSnapshots);
+    setLibraryStats(fetchedLibraryStats);
     setPlaylists((currentPlaylists) => {
       if (playlistReorderOnNextLoadRef.current || !currentPlaylists.length) {
         playlistReorderOnNextLoadRef.current = false;
@@ -555,20 +570,20 @@ function App() {
                     />
                   </div>
                   <div className="field">
-                    <label htmlFor="cycleFrequency">Scan & playlist frequency</label>
+                    <label htmlFor="cycleSchedule">Cycle schedule</label>
                     <select
-                      id="cycleFrequency"
-                      value={settingsDraft.cycleFrequency}
+                      id="cycleSchedule"
+                      value={settingsDraft.cycleSchedule}
                       onChange={(event) => {
-                        setSettingsDraft((prev) => ({ ...prev, cycleFrequency: event.target.value }));
+                        setSettingsDraft((prev) => ({ ...prev, cycleSchedule: event.target.value }));
                         setSettingsDirty(true);
                       }}
                     >
+                      <option value="every-12-hours">Every 12 hours</option>
                       <option value="daily">Daily</option>
-                      <option value="every-2-days">Every 2 days</option>
-                      <option value="twice-weekly">Twice weekly (Wed & Sun)</option>
-                      <option value="weekly">Weekly (Sunday)</option>
-                      <option value="monthly">Monthly (1st)</option>
+                      <option value="every-3-days">Every 3 days</option>
+                      <option value="twice-weekly">Twice weekly</option>
+                      <option value="weekly">Weekly</option>
                     </select>
                   </div>
                 </div>
@@ -603,8 +618,7 @@ function App() {
             <span className={`signal ${hasSubsonicConnection ? "ok" : "bad"}`}>Navidrome {hasSubsonicConnection ? "Ready" : "Missing"}</span>
             <span className={`signal ${keyStatus.lastfm ? "ok" : "warn"}`}>Last.fm {keyStatus.lastfm ? "Ready" : "Optional"}</span>
             <span className={`signal ${stats.analyzedTracks ? "ok" : "warn"}`}>Analyzed {stats.analyzedTracks}/{stats.tracks}</span>
-            <span className="signal neutral">{settings.cycleFrequency === "daily" ? "Daily scan" : settings.cycleFrequency === "every-2-days" ? "Scan every 2d" : settings.cycleFrequency === "twice-weekly" ? "Scan 2x/week" : settings.cycleFrequency === "monthly" ? "Monthly scan" : "Scan weekly"}</span>
-            <span className="signal neutral">Playlists/Week {settings.weeklyPlaylistCount}</span>
+            <span className="signal neutral">Schedule {settings.cycleSchedule === "every-12-hours" ? "12h" : settings.cycleSchedule === "daily" ? "Daily" : settings.cycleSchedule === "every-3-days" ? "3d" : settings.cycleSchedule === "twice-weekly" ? "2×/wk" : "Weekly"}</span>
             <span className="signal neutral">Max Tracks {settings.maxTracksPerPlaylist}</span>
           </div>
           {worker ? (
@@ -696,6 +710,12 @@ function App() {
               >
                 History
               </button>
+              <button
+                className={`tab ${playlistTab === "stats" ? "active" : ""}`}
+                onClick={() => setPlaylistTab("stats")}
+              >
+                Stats
+              </button>
             </div>
             <button
               className="ghost-button icon-button"
@@ -764,7 +784,7 @@ function App() {
                 </li>
               ))}
             </ul>
-            ) : (
+            ) : playlistTab === "history" ? (
             snapshots.length === 0 ? (
               <p className="emptyState">No history yet. Old playlists will appear here after the next weekly refresh.</p>
             ) : (
@@ -790,6 +810,110 @@ function App() {
               ))}
             </ul>
             )
+            ) : (
+              libraryStats ? (
+                <div className="statsPanel">
+                  <div className="statSection">
+                    <h4>Top Genres</h4>
+                    <div className="statBars">
+                      {libraryStats.topGenres.map((g) => (
+                        <div key={g.genre} className="statBar">
+                          <span className="statBarLabel">{g.genre}</span>
+                          <span className="statBarTrack">
+                            <span className="statBarFill" style={{ width: `${Math.max(1, (g.count / libraryStats.topGenres[0].count) * 100)}%` }} />
+                          </span>
+                          <span className="statBarCount">{g.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="statSection">
+                    <h4>Top Tags</h4>
+                    <div className="statBars">
+                      {libraryStats.topTags.slice(0, 15).map((t) => (
+                        <div key={t.tag} className="statBar">
+                          <span className="statBarLabel">{t.tag}</span>
+                          <span className="statBarTrack">
+                            <span className="statBarFill statBarFillTag" style={{ width: `${Math.max(1, (t.count / libraryStats.topTags[0].count) * 100)}%` }} />
+                          </span>
+                          <span className="statBarCount">{t.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="statSection">
+                    <h4>Audio Distribution</h4>
+                    <div className="statGrid">
+                      {Object.entries(libraryStats.audioDistributions).map(([feature, buckets]) => (
+                        <div key={feature} className="statBar statBarColumn">
+                          <span className="statBarLabel">{feature.charAt(0).toUpperCase() + feature.slice(1)}</span>
+                          <div className="statColumnBars">
+                            {buckets.map((count, i) => (
+                              <span key={i} className="statColumnBar" style={{ height: `${Math.max(1, (count / Math.max(1, ...buckets)) * 100)}%` }} />
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {libraryStats.keyDistribution.length > 0 ? (
+                    <div className="statSection">
+                      <h4>Key Distribution</h4>
+                      <div className="statBars">
+                        {libraryStats.keyDistribution.map((k) => (
+                          <div key={k.key} className="statBar">
+                            <span className="statBarLabel">{k.key}</span>
+                            <span className="statBarTrack">
+                              <span className={`statBarFill ${k.key.endsWith("A") ? "statBarFillMinor" : "statBarFillMajor"}`} style={{ width: `${Math.max(1, (k.count / Math.max(1, ...libraryStats.keyDistribution.map((x) => x.count))) * 100)}%` }} />
+                            </span>
+                            <span className="statBarCount">{k.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  {libraryStats.decadeSpread.length > 0 ? (
+                    <div className="statSection">
+                      <h4>Decades</h4>
+                      <div className="statBars">
+                        {libraryStats.decadeSpread.map((d) => (
+                          <div key={d.decade} className="statBar">
+                            <span className="statBarLabel">{d.decade}</span>
+                            <span className="statBarTrack">
+                              <span className="statBarFill statBarFillDecade" style={{ width: `${Math.max(1, (d.count / Math.max(1, ...libraryStats.decadeSpread.map((x) => x.count))) * 100)}%` }} />
+                            </span>
+                            <span className="statBarCount">{d.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  {libraryStats.languageBreakdown.length > 0 ? (
+                    <div className="statSection">
+                      <h4>Languages</h4>
+                      <div className="statBars">
+                        {libraryStats.languageBreakdown.map((l) => (
+                          <div key={l.language} className="statBar">
+                            <span className="statBarLabel">{l.language}</span>
+                            <span className="statBarTrack">
+                              <span className="statBarFill statBarFillLang" style={{ width: `${Math.max(1, (l.count / Math.max(1, ...libraryStats.languageBreakdown.map((x) => x.count))) * 100)}%` }} />
+                            </span>
+                            <span className="statBarCount">{l.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="statSection">
+                    <h4>BPM Stats</h4>
+                    <p className="statSummary">
+                      Range {Math.round(libraryStats.bpmStats.min)}–{Math.round(libraryStats.bpmStats.max)} BPM · Average {libraryStats.bpmStats.avg} BPM · Median {libraryStats.bpmStats.median} BPM
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <p className="emptyState">Loading stats…</p>
+              )
             )}
           </div>
         </article>

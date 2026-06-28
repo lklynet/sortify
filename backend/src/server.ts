@@ -13,7 +13,7 @@ import { buildSubsonicStreamUrl, getSubsonicConnection, subsonicRequest, navidro
 import { renderPlaylistArtwork, isUsableArtworkImage, sanitizeFilename } from "./artwork-renderer.js";
 import { fetchLastFmTags, fetchLastFmArtistImage } from "./lastfm.js";
 import { fetchMusicBrainzTags } from "./musicbrainz.js";
-import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick, configureSchedule, CYCLE_FREQUENCIES } from "./scheduler.js";
+import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick, schedulePresets, defaultSchedulePreset, rescheduleCycle } from "./scheduler.js";
 import { createLogger } from "./logger.js";
 
 type TrackRecord = {
@@ -79,7 +79,7 @@ type AppSettings = {
   lastFmApiKey: string;
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
-  cycleFrequency: string;
+  cycleSchedule: string;
 };
 
 type OperationLogEntry = {
@@ -175,7 +175,7 @@ const settings: AppSettings = {
   lastFmApiKey: defaultLastFmApiKey,
   weeklyPlaylistCount: 3,
   maxTracksPerPlaylist: defaultMaxTracksPerPlaylist,
-  cycleFrequency: "weekly"
+  cycleSchedule: defaultSchedulePreset
 };
 
 function appendLog(entry: Omit<OperationLogEntry, "id" | "timestamp">) {
@@ -477,9 +477,9 @@ function loadPersistedSettings() {
   if (!Number.isNaN(maxTracks)) {
     settings.maxTracksPerPlaylist = clamp(maxTracks, 5, 100);
   }
-  const persistedCycleFrequency = read("cycleFrequency");
-  if (persistedCycleFrequency !== undefined && CYCLE_FREQUENCIES[persistedCycleFrequency]) {
-    settings.cycleFrequency = persistedCycleFrequency;
+  const savedSchedule = read("cycleSchedule");
+  if (savedSchedule && schedulePresets[savedSchedule]) {
+    settings.cycleSchedule = savedSchedule;
   }
   const workerRunning = read("workerRunning");
   if (workerRunning !== undefined) {
@@ -502,7 +502,7 @@ function persistSettings() {
     upsertSettingStmt.run("lastFmApiKey", encryptSettingValue(settings.lastFmApiKey));
     upsertSettingStmt.run("weeklyPlaylistCount", String(settings.weeklyPlaylistCount));
     upsertSettingStmt.run("maxTracksPerPlaylist", String(settings.maxTracksPerPlaylist));
-    upsertSettingStmt.run("cycleFrequency", settings.cycleFrequency);
+    upsertSettingStmt.run("cycleSchedule", settings.cycleSchedule);
     upsertSettingStmt.run("workerRunning", String(workerState.running));
     upsertSettingStmt.run("workerLastRunAt", workerState.lastRunAt ?? "");
     upsertSettingStmt.run("workerLastRunWeek", workerState.lastRunWeek ?? "");
@@ -512,7 +512,8 @@ function persistSettings() {
 }
 
 loadPersistedSettings();
-log.info("settings loaded", { navidromeConfigured: Boolean(settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword), workerRunning: workerState.running });
+rescheduleCycle(schedulePresets[settings.cycleSchedule]?.cron ?? schedulePresets[defaultSchedulePreset].cron);
+log.info("settings loaded", { navidromeConfigured: Boolean(settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword), workerRunning: workerState.running, schedule: settings.cycleSchedule });
 
 function syncWorkerConnectionFromSettings() {
   if (settings.navidromeUrl && settings.navidromeUsername && settings.navidromePassword) {
@@ -1224,35 +1225,45 @@ async function refreshRecommendedPlaylists(
   return { candidates, sourceTracks: syncableTracks.length };
 }
 
-function nextRunFromFrequency(now = new Date()): Date {
+function weeklyStartIso(now = new Date()): string {
   const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const day = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + (8 - day));
   date.setUTCHours(0, 0, 0, 0);
-  const freq = settings.cycleFrequency;
-  if (freq === "daily") {
-    date.setUTCDate(date.getUTCDate() + 1);
-  } else if (freq === "every-2-days") {
-    date.setUTCDate(date.getUTCDate() + 2);
-  } else if (freq === "twice-weekly") {
-    const day = date.getUTCDay();
-    if (day < 3) date.setUTCDate(date.getUTCDate() + (3 - day));
-    else if (day < 7) date.setUTCDate(date.getUTCDate() + (7 - day));
-    else date.setUTCDate(date.getUTCDate() + 3);
-  } else if (freq === "monthly") {
-    date.setUTCMonth(date.getUTCMonth() + 1);
-    date.setUTCDate(1);
-  } else {
-    const day = date.getUTCDay() || 7;
-    date.setUTCDate(date.getUTCDate() + (8 - day));
-  }
-  return date;
+  return date.toISOString();
 }
 
-function nextWeekStartIso(now = new Date()): string {
-  return nextRunFromFrequency(now).toISOString();
+function nextCycleStartIso(now = new Date()): string {
+  const preset = schedulePresets[settings.cycleSchedule];
+  if (!preset) return weeklyStartIso();
+  const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+  if (settings.cycleSchedule === "every-12-hours") {
+    const cutoff = new Date(date);
+    cutoff.setUTCHours(new Date(now.toUTCString()).getUTCHours() < 12 ? 12 : 24);
+    if (cutoff <= now) cutoff.setUTCDate(cutoff.getUTCDate() + 1);
+    return cutoff.toISOString();
+  }
+  if (settings.cycleSchedule === "daily") {
+    date.setUTCDate(date.getUTCDate() + 1);
+    return date.toISOString();
+  }
+  if (settings.cycleSchedule === "every-3-days") {
+    const day = date.getUTCDate();
+    const next = day + (3 - (day % 3 || 3));
+    date.setUTCDate(next);
+    return date.toISOString();
+  }
+  if (settings.cycleSchedule === "twice-weekly") {
+    const day = date.getUTCDay();
+    const nextDay = day === 0 ? 3 : day < 3 ? 3 : 7;
+    date.setUTCDate(date.getUTCDate() + (nextDay - day));
+    return date.toISOString();
+  }
+  return weeklyStartIso();
 }
 
 function setWorkerScheduleHints() {
-  workerState.nextRunAt = workerState.running ? nextWeekStartIso() : null;
+  workerState.nextRunAt = workerState.running ? nextCycleStartIso() : null;
 }
 
 async function runWorkerCycle(trigger: "start" | "weekly"): Promise<void> {
@@ -1382,7 +1393,7 @@ function settingsSnapshot() {
     hasLastFmApiKey: Boolean(settings.lastFmApiKey),
     weeklyPlaylistCount: settings.weeklyPlaylistCount,
     maxTracksPerPlaylist: settings.maxTracksPerPlaylist,
-    cycleFrequency: settings.cycleFrequency
+    cycleSchedule: settings.cycleSchedule
   };
 }
 
@@ -1415,11 +1426,11 @@ app.patch("/api/settings", (req, res) => {
   if (body.maxTracksPerPlaylist !== undefined) {
     settings.maxTracksPerPlaylist = clamp(Number(body.maxTracksPerPlaylist), 5, 100);
   }
-  if (body.cycleFrequency !== undefined) {
-    const freq = String(body.cycleFrequency ?? "").trim();
-    if (CYCLE_FREQUENCIES[freq]) {
-      settings.cycleFrequency = freq;
-      configureSchedule(settings.cycleFrequency);
+  if (body.cycleSchedule !== undefined) {
+    const preset = String(body.cycleSchedule).trim();
+    if (schedulePresets[preset]) {
+      settings.cycleSchedule = preset;
+      rescheduleCycle(schedulePresets[preset].cron);
     }
   }
   syncWorkerConnectionFromSettings();
@@ -1447,6 +1458,82 @@ app.get("/api/stats", (_req, res) => {
     .prepare("SELECT COUNT(*) as count FROM tracks WHERE analysis_version = ? AND audio_vector_json != '[]'")
     .get(audioAnalysisVersion) as { count: number };
   res.json({ tracks: trackCount.count, playlists: playlistCount.count, analyzedTracks: analyzedTrackCount.count });
+});
+
+let libraryStatsCache: { data: unknown; at: number } | null = null;
+const libraryStatsCacheMs = 60_000;
+
+app.get("/api/stats/library", (_req, res) => {
+  const now = Date.now();
+  if (libraryStatsCache && now - libraryStatsCache.at < libraryStatsCacheMs) {
+    res.json(libraryStatsCache.data);
+    return;
+  }
+  const rows = db.prepare("SELECT tags_json, audio_features_json FROM tracks WHERE audio_features_json != '{}'").all() as Array<{ tags_json: string; audio_features_json: string }>;
+  const tagCounts = new Map<string, number>();
+  const keyCounts = new Map<string, number>();
+  const decadeCounts = new Map<string, number>();
+  const languageCounts = new Map<string, number>();
+  const genreCounts = new Map<string, number>();
+  const bpmValues: number[] = [];
+  const buckets: Record<string, number[]> = { energy: new Array(10).fill(0), valence: new Array(10).fill(0), danceability: new Array(10).fill(0), acousticness: new Array(10).fill(0), instrumentalness: new Array(10).fill(0), brightness: new Array(10).fill(0) };
+  const bpmKeys = ["energy", "valence", "danceability", "acousticness", "instrumentalness", "brightness"] as const;
+  for (const row of rows) {
+    let tags: string[] = [];
+    let features: Record<string, unknown> = {};
+    try { tags = JSON.parse(row.tags_json) as string[]; } catch { /* empty */ }
+    try { features = JSON.parse(row.audio_features_json) as Record<string, unknown>; } catch { /* empty */ }
+    for (const tag of tags) {
+      const count = (tagCounts.get(tag) ?? 0) + 1;
+      tagCounts.set(tag, count);
+      if (tag === "japanese" || tag === "korean" || tag === "chinese" || tag === "russian" || tag === "arabic" || tag === "hindi") {
+        languageCounts.set(tag, count);
+      }
+      if (/^\d{4}s$/.test(tag)) {
+        decadeCounts.set(tag, (decadeCounts.get(tag) ?? 0) + 1);
+      }
+    }
+    const key = features.key as string | undefined;
+    if (key) keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+    const bpm = features.bpm as number | null;
+    if (bpm && bpm > 0 && Number.isFinite(bpm)) bpmValues.push(bpm);
+    for (const feature of bpmKeys) {
+      const val = features[feature] as number | undefined;
+      if (typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 1) {
+        const bucket = Math.min(9, Math.floor(val * 10));
+        buckets[feature][bucket] += 1;
+      }
+    }
+  }
+  const sortedTags = [...tagCounts.entries()].sort((a, b) => b[1] - a[1]);
+  const topTags = sortedTags.slice(0, 30).map(([tag, count]) => ({ tag, count }));
+  const topGenres = sortedTags.filter(([tag]) => !/^\d{4}s$/.test(tag) && !["japanese", "korean", "chinese", "russian", "arabic", "hindi"].includes(tag) && !["decade", "low tempo", "mid tempo", "high energy", "chill", "dance", "minor key", "major key", "bright", "dark", "melancholic", "euphoric", "positive", "moody", "acoustic", "organic", "electronic", "processed", "energetic", "gentle", "calm", "laid-back", "driving", "fast tempo", "danceable", "groove", "rhythmic", "textural", "warm", "uplifting", "instrumental", "cover", "rarity", "remix", "live", "year"].includes(tag)).slice(0, 20).map(([genre, count]) => ({ genre, count }));
+  const keyDist = [...keyCounts.entries()].sort((a, b) => {
+    const numA = parseInt(a[0], 10) || 0;
+    const numB = parseInt(b[0], 10) || 0;
+    return numA - numB || a[0].localeCompare(b[0]);
+  }).map(([key, count]) => ({ key, count }));
+  const decadeSpread = [...decadeCounts.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([decade, count]) => ({ decade, count }));
+  const langs = [...languageCounts.entries()].sort((a, b) => b[1] - a[1]).map(([language, count]) => ({ language, count }));
+  const bpmSorted = [...bpmValues].sort((a, b) => a - b);
+  const data = {
+    trackCount: rows.length,
+    analyzedCount: rows.length,
+    topTags,
+    audioDistributions: buckets,
+    keyDistribution: keyDist,
+    decadeSpread,
+    languageBreakdown: langs,
+    topGenres,
+    bpmStats: {
+      min: bpmSorted[0] ?? 0,
+      max: bpmSorted[bpmSorted.length - 1] ?? 0,
+      avg: bpmSorted.length ? Math.round(bpmSorted.reduce((s, v) => s + v, 0) / bpmSorted.length) : 0,
+      median: bpmSorted.length ? bpmSorted[Math.floor(bpmSorted.length / 2)] : 0
+    }
+  };
+  libraryStatsCache = { data, at: now };
+  res.json(data);
 });
 
 app.get("/api/ops", (req, res) => {
@@ -1808,8 +1895,8 @@ if (frontendDistDir) {
   });
 }
 
-bootstrapScheduler(dbFile, settings.cycleFrequency);
-log.info("scheduler bootstrapped", { cycleFrequency: settings.cycleFrequency });
+bootstrapScheduler(dbFile);
+log.info("scheduler bootstrapped");
 resumeWorkerSchedulerFromPersistence();
 
 app.listen(port, () => {

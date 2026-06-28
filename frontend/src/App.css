@@ -763,6 +763,128 @@ button:disabled {
   text-align: center;
 }
 
+.statsPanel {
+  padding: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.4rem;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.statSection h4 {
+  margin: 0 0 0.6rem;
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.statBars {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.statBar {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.statBarLabel {
+  width: 85px;
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  color: var(--text);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statBarTrack {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+}
+
+.statBarFill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 300ms ease;
+}
+
+.statBarFillTag {
+  background: linear-gradient(90deg, #4c9aff, #6bb5ff);
+}
+
+.statBarFillMajor {
+  background: #4c9aff;
+}
+
+.statBarFillMinor {
+  background: #e8b451;
+}
+
+.statBarFillDecade {
+  background: #8b7a6b;
+}
+
+.statBarFillLang {
+  background: #6ba86b;
+}
+
+.statBarCount {
+  width: 32px;
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.75rem 1rem;
+}
+
+.statBarColumn {
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.statBarColumn .statBarLabel {
+  width: auto;
+  text-align: left;
+}
+
+.statColumnBars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 36px;
+}
+
+.statColumnBar {
+  flex: 1 1 0;
+  min-width: 4px;
+  border-radius: 2px 2px 0 0;
+  background: var(--accent);
+  transition: height 300ms ease;
+}
+
+.statSummary {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
 @media (max-width: 1100px) {
   .content-grid {
     grid-template-columns: 1fr;
