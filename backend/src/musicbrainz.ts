@@ -1,7 +1,9 @@
 import { uniqueTags } from "./tags.js";
 import { createLogger } from "./logger.js";
+import { createRateLimiter } from "./rate-limiter.js";
 
 const log = createLogger("musicbrainz");
+const rateLimit = createRateLimiter(1100);
 
 type MusicBrainzTagResult = {
   recordingTags: string[];
@@ -18,12 +20,12 @@ async function fetchMusicBrainzArtistTags(cache: Map<string, string[]>, artistMb
   }
   const url = `https://musicbrainz.org/ws/2/artist/${encodeURIComponent(artistMbid)}?fmt=json&inc=tags`;
   try {
-    const response = await fetch(url, {
+    const response = await rateLimit(() => fetch(url, {
       signal: AbortSignal.timeout(5000),
       headers: {
         "User-Agent": "Sortify/0.1 ( self-hosted metadata enrich )"
       }
-    });
+    }));
     if (!response.ok) {
       cache.set(artistMbid, []);
       return [];
@@ -41,8 +43,8 @@ async function fetchMusicBrainzArtistTags(cache: Map<string, string[]>, artistMb
     );
     cache.set(artistMbid, tags);
     return tags;
-  } catch {
-    log.warn("musicbrainz artist tags fetch failed", { artistMbid });
+  } catch (err) {
+    log.warn("musicbrainz artist tags fetch failed", { artistMbid, err });
     cache.set(artistMbid, []);
     return [];
   }
@@ -60,12 +62,12 @@ export async function fetchMusicBrainzTags(artist: string, title: string, cache:
   });
   const url = `https://musicbrainz.org/ws/2/recording?${query.toString()}`;
   try {
-    const response = await fetch(url, {
+    const response = await rateLimit(() => fetch(url, {
       signal: AbortSignal.timeout(5000),
       headers: {
         "User-Agent": "Sortify/0.1 ( self-hosted metadata enrich )"
       }
-    });
+    }));
     if (!response.ok) {
       return { recordingTags: [], artistTags: [], year: null };
     }
@@ -115,8 +117,8 @@ export async function fetchMusicBrainzTags(artist: string, title: string, cache:
       artistTags,
       year: Number.isNaN(year) ? null : year
     };
-  } catch {
-    log.warn("musicbrainz recording fetch failed", { artist, title });
+  } catch (err) {
+    log.warn("musicbrainz recording fetch failed", { artist, title, err });
     return { recordingTags: [], artistTags: [], year: null };
   }
 }

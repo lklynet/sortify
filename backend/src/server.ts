@@ -10,8 +10,8 @@ import { fileURLToPath } from "node:url";
 import { deriveBaseTags, mergeRankedTagSources, normalizeTag, uniqueTags } from "./tags.js";
 import { generateCandidates, hashSeed, seededRandom, limitTracksByArtist, tagsFromTrack, audioVectorFromTrack, maxArtistPerPlaylist, maxArtistFallbackPerPlaylist, type PlaylistCandidate } from "./playlist-generator.js";
 import { buildSubsonicStreamUrl, getSubsonicConnection, subsonicRequest, navidromeLogin, uploadNavidromePlaylistArtwork, fetchSubsonicSongs, type SubsonicConnection } from "./subsonic-client.js";
-import { renderPlaylistArtwork, isUsableArtworkImage, sanitizeFilename } from "./artwork-renderer.js";
-import { fetchLastFmTags, fetchLastFmArtistImage } from "./lastfm.js";
+import { renderPlaylistArtwork, sanitizeFilename } from "./artwork-renderer.js";
+import { fetchLastFmTags } from "./lastfm.js";
 import { fetchMusicBrainzTags } from "./musicbrainz.js";
 import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick, schedulePresets, defaultSchedulePreset, rescheduleCycle } from "./scheduler.js";
 import { createLogger } from "./logger.js";
@@ -38,7 +38,7 @@ type PlaylistRecord = {
   slug: string;
   name: string;
   description: string | null;
-  mode: "dynamic" | "pinned" | "locked";
+  mode: "dynamic" | "pinned";
   selected: number;
   sync_target: "subsonic";
   is_recommended: number;
@@ -358,8 +358,12 @@ if (!hasColumn("artwork_signature")) {
 if (!hasColumn("artwork_updated_at")) {
   db.exec("ALTER TABLE playlists ADD COLUMN artwork_updated_at TEXT NOT NULL DEFAULT ''");
 }
-db.exec("UPDATE playlists SET mode = 'locked' WHERE mode = 'frozen'");
-db.exec("UPDATE playlists SET mode = 'dynamic' WHERE mode NOT IN ('dynamic', 'pinned', 'locked')");
+if (!hasColumn("filter_json")) {
+  db.exec("ALTER TABLE playlists ADD COLUMN filter_json TEXT NOT NULL DEFAULT ''");
+}
+db.exec("UPDATE playlists SET mode = 'pinned' WHERE mode = 'locked'");
+db.exec("UPDATE playlists SET mode = 'pinned' WHERE mode = 'frozen'");
+db.exec("UPDATE playlists SET mode = 'dynamic' WHERE mode NOT IN ('dynamic', 'pinned')");
 db.exec("UPDATE playlists SET updated_at = CASE WHEN updated_at = '' THEN created_at ELSE updated_at END");
 log.info("database initialized", { dbFile: dbFile });
 
@@ -421,6 +425,13 @@ SET updated_at = @updated_at,
     is_recommended = 1
 WHERE id = @id
 `);
+const refreshProtectedPlaylistDescriptionStmt = db.prepare(`
+UPDATE playlists
+SET description = @description,
+    updated_at = @updated_at,
+    is_recommended = 1
+WHERE id = @id
+`);
 const updatePlaylistArtworkStmt = db.prepare(`
 UPDATE playlists
 SET artwork_path = @artwork_path,
@@ -471,7 +482,7 @@ function loadPersistedSettings() {
   }
   const weekly = Number.parseInt(read("weeklyPlaylistCount") ?? "", 10);
   if (!Number.isNaN(weekly)) {
-    settings.weeklyPlaylistCount = clamp(weekly, 1, 8);
+    settings.weeklyPlaylistCount = clamp(weekly, 0, 8);
   }
   const maxTracks = Number.parseInt(read("maxTracksPerPlaylist") ?? "", 10);
   if (!Number.isNaN(maxTracks)) {
@@ -531,7 +542,6 @@ syncWorkerConnectionFromSettings();
 
 const lastFmArtistTagsCache = new Map<string, string[]>();
 const lastFmAlbumTagsCache = new Map<string, string[]>();
-const lastFmArtistImageCache = new Map<string, { imageUrl: string; artistUrl: string } | null>();
 const musicBrainzArtistTagsCache = new Map<string, string[]>();
 
 function isoWeekKey(now = new Date()): string {
@@ -618,22 +628,6 @@ function pruneGeneratedArtworkFiles() {
   }
 }
 
-
-
-function artistNameForArtistSignalPlaylist(playlist: PlaylistRecord, description: string, title: string): string | null {
-  if (!playlist.slug.startsWith("artist-")) {
-    return null;
-  }
-  const descriptionMatch = description.match(/sharing signature tags with\s+(.+)$/i);
-  if (descriptionMatch?.[1]?.trim()) {
-    return descriptionMatch[1].trim();
-  }
-  const titleMatch = title.match(/^(.*)\s+(Constellation|Orbit|Signal|Axis|Halo)$/i);
-  if (titleMatch?.[1]?.trim()) {
-    return titleMatch[1].trim();
-  }
-  return null;
-}
 
 function audioFeaturesFromTrack(track: Pick<TrackRecord, "audio_features_json">): AudioAnalysis | null {
   try {
@@ -794,17 +788,20 @@ async function scanLibrary(
       continue;
     }
     try {
-      const musicBrainz = await fetchMusicBrainzTags(artist, title, musicBrainzArtistTagsCache);
+      const [musicBrainz, analyzedAudio, lastFmTags] = await Promise.all([
+        fetchMusicBrainzTags(artist, title, musicBrainzArtistTagsCache),
+        analyzeTrackAudio(connection, song.id).catch((error) => {
+          appendLog({
+            level: "warn",
+            scope: "scan",
+            message: "Audio analysis skipped for track",
+            meta: { songId: song.id, title: song.title, error: error instanceof Error ? error.message : "Unknown error" }
+          });
+          return null;
+        }),
+        fetchLastFmTags(settings.lastFmApiKey, artist, title, album, { artistTags: lastFmArtistTagsCache, albumTags: lastFmAlbumTagsCache })
+      ]);
       const mergedYear = year ?? musicBrainz.year ?? null;
-      const analyzedAudio = await analyzeTrackAudio(connection, song.id).catch((error) => {
-        appendLog({
-          level: "warn",
-          scope: "scan",
-          message: "Audio analysis skipped for track",
-          meta: { songId: song.id, title: song.title, error: error instanceof Error ? error.message : "Unknown error" }
-        });
-        return null;
-      });
       const preservedAudio = existing
         ? {
             features: audioFeaturesFromTrack(existing),
@@ -815,7 +812,6 @@ async function scanLibrary(
       const audioVector = analyzedAudio?.vector ?? preservedAudio?.vector ?? [];
       const rawGenres = song.genre ? song.genre.split(/[,;/|]+/).map((g) => g.trim()).filter(Boolean) : [];
       const baseTags = deriveBaseTags(title, artist, mergedYear, rawGenres, audioFeatures?.bpm ?? null);
-      const lastFmTags = await fetchLastFmTags(settings.lastFmApiKey, artist, title, album, { artistTags: lastFmArtistTagsCache, albumTags: lastFmAlbumTagsCache });
       const audioTags = audioFeatures?.moodTags ?? [];
       const tags = mergeRankedTagSources([
         { source: "base", weight: 0.42, tags: baseTags },
@@ -890,7 +886,7 @@ async function scanLibrary(
 
 function getManagedPlaylistNamesBySlug() {
   const rows = db
-    .prepare("SELECT slug, name FROM playlists WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')")
+    .prepare("SELECT slug, name FROM playlists WHERE is_recommended = 1 OR mode = 'pinned'")
     .all() as Array<{ slug: string; name: string }>;
   return new Map(rows.map((row) => [row.slug, row.name]));
 }
@@ -904,9 +900,6 @@ function replacePlaylists(candidates: PlaylistCandidate[]) {
       const existing = findPlaylistBySlugStmt.get(playlist.slug) as PlaylistRecord | undefined;
       let playlistId = 0;
       if (existing) {
-        if (existing.mode === "locked") {
-          continue;
-        }
         playlistId = existing.id;
         if (existing.mode === "pinned") {
           refreshProtectedPlaylistStmt.run({
@@ -943,7 +936,8 @@ function replacePlaylists(candidates: PlaylistCandidate[]) {
         }
       }
       deletePlaylistTracksByPlaylistIdStmt.run(playlistId);
-      playlist.trackIds.forEach((trackId, position) => {
+      const cappedTrackIds = existing?.mode === "pinned" ? playlist.trackIds.slice(0, settings.maxTracksPerPlaylist) : playlist.trackIds;
+      cappedTrackIds.forEach((trackId, position) => {
         insertPlaylistTrackStmt.run(playlistId, trackId, position + 1);
       });
     }
@@ -979,19 +973,9 @@ async function syncPlaylistArtwork(
       return;
     }
   }
-  const artists = [...new Set(trackRows.map((row) => row.artist?.trim()).filter((value): value is string => Boolean(value)))];
-  const sourceArtist = artistNameForArtistSignalPlaylist(playlist, description, title);
-  const lastFmArtistImage = sourceArtist ? await fetchLastFmArtistImage(settings.lastFmApiKey, sourceArtist, lastFmArtistImageCache, isUsableArtworkImage) : null;
-  let imageUrl = "";
-  let artworkAttribution = "";
-  let artworkAttributionUrl = "";
-  if (lastFmArtistImage?.imageUrl && (await isUsableArtworkImage(lastFmArtistImage.imageUrl))) {
-    imageUrl = lastFmArtistImage.imageUrl;
-    artworkAttribution = `Artist image for ${sourceArtist} via Last.fm`;
-    artworkAttributionUrl = lastFmArtistImage.artistUrl || "https://www.last.fm/api/show/artist.getInfo";
-  } else {
-    imageUrl = "https://picsum.photos/1200";
-  }
+  const imageUrl = "https://picsum.photos/1200";
+  const artworkAttribution = "";
+  const artworkAttributionUrl = "";
   const rendered = await renderPlaylistArtwork(title, imageUrl);
   const fileName = `${sanitizeFilename(playlist.slug)}-${signature.slice(0, 12)}.jpg`;
   const localPath = path.join(generatedArtworkDir, fileName);
@@ -1013,14 +997,91 @@ async function syncPlaylistArtwork(
   }
 }
 
+async function syncSinglePlaylist(connection: SubsonicConnection, playlistId: number, now: string) {
+  const playlist = db
+    .prepare(
+      `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at,
+              artwork_path, artwork_attribution, artwork_attribution_url, artwork_signature, artwork_updated_at
+       FROM playlists WHERE id = ?`
+    )
+    .get(playlistId) as PlaylistRecord | undefined;
+  if (!playlist) return;
+  const trackRows = db
+    .prepare(
+      `SELECT pt.track_id as trackId, t.path, t.artist FROM playlist_tracks pt
+       JOIN tracks t ON t.id = pt.track_id
+       WHERE pt.playlist_id = ?
+       ORDER BY pt.position`
+    )
+    .all(playlist.id) as Array<{ trackId: number; path: string; artist: string | null }>;
+  const weekKey = isoWeekKey();
+  const weeklyTrackIds = weeklyRotatedTrackIds(trackRows, `${playlist.slug}:${weekKey}`, clamp(settings.maxTracksPerPlaylist, 5, 100));
+  const pathByTrackId = new Map<number, string>();
+  for (const row of trackRows) {
+    pathByTrackId.set(row.trackId, row.path);
+  }
+  const songIds = weeklyTrackIds
+    .map((trackId) => pathByTrackId.get(trackId) ?? "")
+    .map((pathValue) => extractSubsonicSongId(pathValue))
+    .filter((value): value is string => Boolean(value));
+  const remoteList = await subsonicRequest<{ playlists?: { playlist?: Array<{ id: string; name: string }> } }>(
+    connection,
+    "getPlaylists.view"
+  );
+  const remoteByName = new Map<string, string>();
+  for (const rp of remoteList.playlists?.playlist ?? []) {
+    remoteByName.set(rp.name, rp.id);
+  }
+  let remoteId = remoteByName.get(playlist.name) ?? "";
+  if (!remoteId) {
+    await subsonicRequest(connection, "createPlaylist.view", { name: playlist.name });
+    const refreshed = await subsonicRequest<{ playlists?: { playlist?: Array<{ id: string; name: string }> } }>(
+      connection,
+      "getPlaylists.view"
+    );
+    for (const rp of refreshed.playlists?.playlist ?? []) {
+      if (rp.name === playlist.name) {
+        remoteId = rp.id;
+        break;
+      }
+    }
+  }
+  if (!remoteId) return;
+  const detail = await subsonicRequest<{ playlist?: { entry?: Array<{ id: string }> } }>(connection, "getPlaylist.view", {
+    id: remoteId
+  });
+  const entries = detail.playlist?.entry ?? [];
+  if (entries.length) {
+    await subsonicRequest(connection, "updatePlaylist.view", {
+      playlistId: remoteId,
+      songIndexToRemove: entries.map((_, index) => String(entries.length - 1 - index))
+    });
+  }
+  for (const songId of songIds) {
+    await subsonicRequest(connection, "updatePlaylist.view", { playlistId: remoteId, songIdToAdd: songId });
+  }
+  const token = await navidromeLogin(connection);
+  await syncPlaylistArtwork(
+    connection,
+    playlist,
+    remoteId,
+    playlist.name,
+    playlist.description ?? "",
+    weeklyTrackIds,
+    trackRows,
+    async () => token
+  );
+  previousRecommendedPlaylistNamesBySlug.set(playlist.slug, playlist.name);
+}
+
 async function syncSubsonicPlaylists(connection: SubsonicConnection) {
   const managedPlaylists = db
     .prepare(
       `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at,
               artwork_path, artwork_attribution, artwork_attribution_url, artwork_signature, artwork_updated_at
        FROM playlists
-       WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')
-       ORDER BY CASE mode WHEN 'locked' THEN 0 WHEN 'pinned' THEN 1 ELSE 2 END, name`
+       WHERE is_recommended = 1 OR mode = 'pinned'
+       ORDER BY CASE mode WHEN 'pinned' THEN 1 ELSE 2 END, name`
     )
     .all() as PlaylistRecord[];
   const remoteList = await subsonicRequest<{ playlists?: { playlist?: Array<{ id: string; name: string }> } }>(
@@ -1049,10 +1110,7 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
          ORDER BY pt.position`
       )
       .all(playlist.id) as Array<{ trackId: number; path: string; artist: string | null }>;
-    const weeklyTrackIds =
-      playlist.mode === "locked"
-        ? trackRows.map((row) => row.trackId)
-        : weeklyRotatedTrackIds(trackRows, `${playlist.slug}:${weekKey}`, clamp(settings.maxTracksPerPlaylist, 5, 100));
+    const weeklyTrackIds = weeklyRotatedTrackIds(trackRows, `${playlist.slug}:${weekKey}`, clamp(settings.maxTracksPerPlaylist, 5, 100));
     const pathByTrackId = new Map<number, string>();
     for (const row of trackRows) {
       pathByTrackId.set(row.trackId, row.path);
@@ -1072,7 +1130,6 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
         remoteByName.set(targetName, remoteId);
       }
     }
-    const remoteAlreadyExisted = Boolean(remoteId);
     if (!remoteId) {
       await subsonicRequest(connection, "createPlaylist.view", {
         name: targetName
@@ -1098,10 +1155,6 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
       });
       continue;
     }
-    if (playlist.mode === "locked" && remoteAlreadyExisted) {
-      applied += 1;
-      continue;
-    }
     const detail = await subsonicRequest<{ playlist?: { entry?: Array<{ id: string }> } }>(connection, "getPlaylist.view", {
       id: remoteId
     });
@@ -1123,9 +1176,8 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
     for (const songId of songIds) {
       await subsonicRequest(connection, "updatePlaylist.view", { playlistId: remoteId, songIdToAdd: songId });
     }
-    if (playlist.mode !== "locked") {
-      try {
-        await syncPlaylistArtwork(
+    try {
+      await syncPlaylistArtwork(
           connection,
           playlist,
           remoteId,
@@ -1146,7 +1198,6 @@ async function syncSubsonicPlaylists(connection: SubsonicConnection) {
           }
         });
       }
-    }
     applied += 1;
   }
   const managedNames = new Set(managedPlaylists.map((playlist) => playlist.name));
@@ -1171,16 +1222,18 @@ async function refreshRecommendedPlaylists(
   weeklyPlaylistCount = workerState.weeklyPlaylistCount,
   generationKey = isoWeekKey()
 ) {
+  if (weeklyPlaylistCount <= 0) {
+    appendLog({
+      level: "info",
+      scope: "playlist",
+      message: "Playlist generation skipped (count set to 0)",
+      meta: { weeklyPlaylistCount }
+    });
+    return { candidates: [], sourceTracks: 0 };
+  }
   const pinnedSlugs = new Set(
     (
       db.prepare("SELECT slug FROM playlists WHERE mode = 'pinned'").all() as Array<{
-        slug: string;
-      }>
-    ).map((row) => row.slug)
-  );
-  const lockedSlugs = new Set(
-    (
-      db.prepare("SELECT slug FROM playlists WHERE mode = 'locked'").all() as Array<{
         slug: string;
       }>
     ).map((row) => row.slug)
@@ -1195,6 +1248,8 @@ async function refreshRecommendedPlaylists(
     id: track.id,
     title: track.title,
     artist: track.artist,
+    album: track.album,
+    year: track.year,
     tags_json: track.tags_json,
     audio_features_json: track.audio_features_json,
     audio_vector_json: track.audio_vector_json,
@@ -1211,10 +1266,71 @@ async function refreshRecommendedPlaylists(
     maxTracksPerPlaylist,
     generationKey,
     pinnedSlugs,
-    lockedSlugs,
     leastPlayedRows,
     favoriteRows
   });
+  const filterPlaylists = db
+    .prepare("SELECT id, slug, name, filter_json FROM playlists WHERE mode = 'pinned' AND filter_json != ''")
+    .all() as Array<{ id: number; slug: string; name: string; filter_json: string }>;
+  for (const fp of filterPlaylists) {
+    let filters: Record<string, unknown> = {};
+    try { filters = JSON.parse(fp.filter_json) as Record<string, unknown>; } catch { continue; }
+    const filterPool = enrichedTracks.filter((track) => {
+      if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
+        const needles = (filters.selectedTags as string[]).map((t) => String(t).toLowerCase());
+        if (!needles.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
+      }
+      if (typeof filters.bpmMin === "number" && !Number.isNaN(filters.bpmMin as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.bpm ?? 0) < (filters.bpmMin as number)) return false;
+      }
+      if (typeof filters.bpmMax === "number" && !Number.isNaN(filters.bpmMax as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.bpm ?? 0) > (filters.bpmMax as number)) return false;
+      }
+      if (typeof filters.keyQuery === "string" && filters.keyQuery) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        const qk = (filters.keyQuery as string).toLowerCase();
+        if (!(af?.key ?? "").toLowerCase().includes(qk) && !(af?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
+      }
+      if (typeof filters.energyMin === "number" && !Number.isNaN(filters.energyMin as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.energy ?? 0) * 100 < (filters.energyMin as number)) return false;
+      }
+      if (typeof filters.energyMax === "number" && !Number.isNaN(filters.energyMax as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.energy ?? 0) * 100 > (filters.energyMax as number)) return false;
+      }
+      if (typeof filters.yearMin === "number" && !Number.isNaN(filters.yearMin as number)) {
+        if ((track.year ?? 0) < (filters.yearMin as number)) return false;
+      }
+      if (typeof filters.yearMax === "number" && !Number.isNaN(filters.yearMax as number)) {
+        if ((track.year ?? 0) > (filters.yearMax as number)) return false;
+      }
+      if (typeof filters.keyMode === "string" && filters.keyMode) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        const key = (af?.key ?? "").toLowerCase();
+        const isMinor = key.includes("m") && !key.includes("major");
+        const isMajor = key && !isMinor;
+        if (filters.keyMode === "minor" && !isMinor) return false;
+        if (filters.keyMode === "major" && !isMajor) return false;
+      }
+      return true;
+    });
+    if (filterPool.length < 5) continue;
+    const trackIds = filterPool.slice(0, settings.maxTracksPerPlaylist).map((t) => t.id);
+    const description = buildFilterDescription(filters);
+    refreshProtectedPlaylistDescriptionStmt.run({ id: fp.id, description, updated_at: new Date().toISOString() });
+    candidates.push({
+      slug: fp.slug,
+      name: fp.name,
+      description,
+      source: "cluster",
+      signatureTags: [],
+      audioVector: [],
+      trackIds
+    });
+  }
   replacePlaylists(candidates);
   appendLog({
     level: "info",
@@ -1420,7 +1536,7 @@ app.patch("/api/settings", (req, res) => {
     settings.lastFmApiKey = String(body.lastFmApiKey ?? "").trim();
   }
   if (body.weeklyPlaylistCount !== undefined) {
-    settings.weeklyPlaylistCount = clamp(Number(body.weeklyPlaylistCount), 1, 8);
+    settings.weeklyPlaylistCount = clamp(Number(body.weeklyPlaylistCount), 0, 8);
     workerState.weeklyPlaylistCount = settings.weeklyPlaylistCount;
   }
   if (body.maxTracksPerPlaylist !== undefined) {
@@ -1555,6 +1671,50 @@ app.get("/api/tracks", (req, res) => {
   );
 });
 
+app.get("/api/tracks/all", (_req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at
+       FROM tracks
+       ORDER BY last_scanned_at DESC, id DESC`
+    )
+    .all() as TrackRecord[];
+  res.json(
+    rows.map((row) => ({
+      ...row,
+      tags: tagsFromTrack(row),
+      audioFeatures: audioFeaturesFromTrack(row),
+      audioVector: audioVectorFromTrack(row)
+    }))
+  );
+});
+
+app.get("/api/tracks/search", (req, res) => {
+  const q = String(req.query.q ?? "").trim();
+  if (!q || q.length < 2) {
+    res.json([]);
+    return;
+  }
+  const pattern = `%${q.replace(/[%_]/g, "\\$&")}%`;
+  const rows = db
+    .prepare(
+      `SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at
+       FROM tracks
+       WHERE title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR album LIKE ? ESCAPE '\\'
+       ORDER BY last_scanned_at DESC, id DESC
+       LIMIT 30`
+    )
+    .all(pattern, pattern, pattern) as TrackRecord[];
+  res.json(
+    rows.map((row) => ({
+      ...row,
+      tags: tagsFromTrack(row),
+      audioFeatures: audioFeaturesFromTrack(row),
+      audioVector: audioVectorFromTrack(row)
+    }))
+  );
+});
+
 app.get("/api/worker", (_req, res) => {
   res.json(workerSnapshot());
 });
@@ -1569,7 +1729,7 @@ app.post("/api/worker/start", (req, res) => {
   }
   const requestedCount = Number(req.body?.weeklyPlaylistCount ?? workerState.weeklyPlaylistCount);
   workerConnection = connection;
-  workerState.weeklyPlaylistCount = clamp(requestedCount, 1, 8);
+  workerState.weeklyPlaylistCount = clamp(requestedCount, 0, 8);
   settings.weeklyPlaylistCount = workerState.weeklyPlaylistCount;
   settings.navidromeUrl = connection.baseUrl;
   settings.navidromeUsername = connection.username;
@@ -1745,7 +1905,7 @@ app.get("/api/scan/:id", (req, res) => {
 
 app.post("/api/playlists/generate", async (req, res) => {
   const requestedCount = Number(req.body?.weeklyPlaylistCount ?? workerState.weeklyPlaylistCount);
-  const count = clamp(requestedCount, 1, 8);
+  const count = clamp(requestedCount, 0, 8);
   const { candidates } = await refreshRecommendedPlaylists(count, randomUUID());
   res.json({ generated: candidates.length, playlists: candidates.map((item) => ({ name: item.name, tracks: item.trackIds.length })) });
 });
@@ -1756,7 +1916,7 @@ app.get("/api/playlists", (_req, res) => {
       `SELECT id, slug, name, description, mode, selected, sync_target, is_recommended, updated_at,
               artwork_path, artwork_attribution, artwork_attribution_url, artwork_signature, artwork_updated_at
        FROM playlists
-       WHERE is_recommended = 1 OR mode IN ('pinned', 'locked')
+       WHERE is_recommended = 1 OR mode = 'pinned'
        ORDER BY CASE mode WHEN 'locked' THEN 0 WHEN 'pinned' THEN 1 ELSE 2 END, name ASC`
     )
     .all() as PlaylistRecord[];
@@ -1788,7 +1948,7 @@ app.get("/api/playlists/snapshots", (_req, res) => {
               COUNT(pt.track_id) as track_count
        FROM playlist_snapshots ps
        LEFT JOIN playlist_tracks pt ON pt.playlist_id = ps.playlist_id
-       WHERE ps.playlist_id IN (SELECT id FROM playlists WHERE is_recommended = 1 OR mode IN ('pinned', 'locked'))
+       WHERE ps.playlist_id IN (SELECT id FROM playlists WHERE is_recommended = 1 OR mode = 'pinned')
        GROUP BY ps.id
        ORDER BY ps.created_at DESC
        LIMIT 40`
@@ -1826,7 +1986,7 @@ app.patch("/api/playlists/:id", async (req, res) => {
     | {
         id: number;
         slug: string;
-        mode: "dynamic" | "pinned" | "locked";
+        mode: "dynamic" | "pinned";
         selected: number;
         sync_target: "subsonic";
         is_recommended: number;
@@ -1840,8 +2000,8 @@ app.patch("/api/playlists/:id", async (req, res) => {
   const selectedInput = req.body?.selected;
   const syncTargetInput = req.body?.syncTarget;
   const selected = typeof selectedInput === "boolean" ? (selectedInput ? 1 : 0) : existing.selected;
-  const mode: "dynamic" | "pinned" | "locked" =
-    modeInput === "locked" || modeInput === "pinned" || modeInput === "dynamic" ? modeInput : existing.mode;
+  const mode: "dynamic" | "pinned" =
+    modeInput === "pinned" || modeInput === "dynamic" ? modeInput : existing.mode;
   const syncTarget: "subsonic" = syncTargetInput === "subsonic" || !syncTargetInput ? "subsonic" : existing.sync_target;
   db.prepare("UPDATE playlists SET mode = ?, selected = ?, sync_target = ?, is_recommended = ?, updated_at = ? WHERE id = ?").run(
     mode,
@@ -1860,6 +2020,369 @@ app.patch("/api/playlists/:id", async (req, res) => {
   });
   res.json({ ok: true });
 });
+
+app.delete("/api/playlists/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid playlist id" });
+    return;
+  }
+  const existing = db
+    .prepare("SELECT id, name, artwork_path FROM playlists WHERE id = ?")
+    .get(id) as { id: number; name: string; artwork_path: string } | undefined;
+  if (!existing) {
+    res.status(404).json({ error: "Playlist not found" });
+    return;
+  }
+  deleteGeneratedArtworkFile(existing.artwork_path);
+  deletePlaylistByIdStmt.run(id);
+  const connection = resolveConnection(req.body?.connection ?? req.body);
+  if (connection) {
+    const remoteList = await subsonicRequest<{ playlists?: { playlist?: Array<{ id: string; name: string }> } }>(connection, "getPlaylists.view");
+    const remoteId = remoteList.playlists?.playlist?.find((p) => p.name === existing.name)?.id;
+    if (remoteId) {
+      await subsonicRequest(connection, "deletePlaylist.view", { id: remoteId });
+    }
+  }
+  appendLog({
+    level: "info",
+    scope: "playlist",
+    message: "Playlist deleted",
+    meta: { id }
+  });
+  res.json({ ok: true });
+});
+
+app.post("/api/playlists/:id/refresh", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid playlist id" });
+    return;
+  }
+  const existing = db
+    .prepare("SELECT id, slug, name, mode, filter_json, artwork_path FROM playlists WHERE id = ?")
+    .get(id) as { id: number; slug: string; name: string; mode: string; filter_json: string; artwork_path: string } | undefined;
+  if (!existing) {
+    res.status(404).json({ error: "Playlist not found" });
+    return;
+  }
+  const tracks = db
+    .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at, play_count, favorite FROM tracks")
+    .all() as TrackRecord[];
+  const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
+  const enrichedTracks = syncableTracks.map((track) => ({
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+    year: track.year,
+    tags_json: track.tags_json,
+    audio_features_json: track.audio_features_json,
+    tags: tagsFromTrack(track)
+  }));
+  let newTrackIds: number[] = [];
+  if (existing.filter_json) {
+    let filters: Record<string, unknown> = {};
+    try { filters = JSON.parse(existing.filter_json) as Record<string, unknown>; } catch { /* ignore */ }
+    const filterPool = enrichedTracks.filter((track) => {
+      if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
+        const needles = (filters.selectedTags as string[]).map((t) => String(t).toLowerCase());
+        if (!needles.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
+      }
+      if (typeof filters.bpmMin === "number" && !Number.isNaN(filters.bpmMin as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.bpm ?? 0) < (filters.bpmMin as number)) return false;
+      }
+      if (typeof filters.bpmMax === "number" && !Number.isNaN(filters.bpmMax as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.bpm ?? 0) > (filters.bpmMax as number)) return false;
+      }
+      if (typeof filters.keyQuery === "string" && filters.keyQuery) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        const qk = (filters.keyQuery as string).toLowerCase();
+        if (!(af?.key ?? "").toLowerCase().includes(qk) && !(af?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
+      }
+      if (typeof filters.energyMin === "number" && !Number.isNaN(filters.energyMin as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.energy ?? 0) * 100 < (filters.energyMin as number)) return false;
+      }
+      if (typeof filters.energyMax === "number" && !Number.isNaN(filters.energyMax as number)) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        if ((af?.energy ?? 0) * 100 > (filters.energyMax as number)) return false;
+      }
+      if (typeof filters.yearMin === "number" && !Number.isNaN(filters.yearMin as number)) {
+        if ((track.year ?? 0) < (filters.yearMin as number)) return false;
+      }
+      if (typeof filters.yearMax === "number" && !Number.isNaN(filters.yearMax as number)) {
+        if ((track.year ?? 0) > (filters.yearMax as number)) return false;
+      }
+      if (typeof filters.keyMode === "string" && filters.keyMode) {
+        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+        const key = (af?.key ?? "").toLowerCase();
+        const isMinor = key.includes("m") && !key.includes("major");
+        const isMajor = key && !isMinor;
+        if (filters.keyMode === "minor" && !isMinor) return false;
+        if (filters.keyMode === "major" && !isMajor) return false;
+      }
+      return true;
+    });
+    newTrackIds = filterPool.slice(0, settings.maxTracksPerPlaylist).map((t) => t.id);
+  } else {
+    const candidates = await generateCandidates({
+      tracks: enrichedTracks as any,
+      desiredWeeklyPlaylists: 1,
+      maxTracksPerPlaylist: settings.maxTracksPerPlaylist,
+      generationKey: randomUUID(),
+      pinnedSlugs: new Set<string>(),
+      leastPlayedRows: [],
+      favoriteRows: []
+    });
+    if (candidates.length > 0) {
+      newTrackIds = candidates[0].trackIds.slice(0, settings.maxTracksPerPlaylist);
+    }
+  }
+  if (newTrackIds.length === 0) {
+    res.status(422).json({ error: "No tracks match the playlist criteria" });
+    return;
+  }
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    deletePlaylistTracksByPlaylistIdStmt.run(id);
+    newTrackIds.forEach((trackId, position) => {
+      insertPlaylistTrackStmt.run(id, trackId, position + 1);
+    });
+    refreshProtectedPlaylistStmt.run({ id, updated_at: now });
+  })();
+  const signature = hashText(`${playlistArtworkRenderVersion}|${existing.slug}|${existing.name}|${existing.mode}|${newTrackIds.join(",")}`);
+  const imageUrl = "https://picsum.photos/1200";
+  const rendered = await renderPlaylistArtwork(existing.name, imageUrl);
+  const fileName = `${sanitizeFilename(existing.slug)}-${signature.slice(0, 12)}.jpg`;
+  const localPath = path.join(generatedArtworkDir, fileName);
+  fs.writeFileSync(localPath, rendered);
+  if (existing.artwork_path) {
+    const previousFile = path.join(generatedArtworkDir, path.basename(existing.artwork_path));
+    if (fs.existsSync(previousFile) && previousFile !== localPath) {
+      fs.unlinkSync(previousFile);
+    }
+  }
+  updatePlaylistArtworkStmt.run({
+    id,
+    artwork_path: `/generated-artwork/${fileName}`,
+    artwork_attribution: "",
+    artwork_attribution_url: "",
+    artwork_signature: signature,
+    artwork_updated_at: now
+  });
+  const connection = resolveConnection(req.body?.connection ?? req.body);
+  if (connection) {
+    await syncSinglePlaylist(connection, id, now);
+  }
+  appendLog({
+    level: "info",
+    scope: "playlist",
+    message: "Playlist refreshed individually",
+    meta: { id, name: existing.name, tracks: newTrackIds.length }
+  });
+  res.json({ ok: true, tracks: newTrackIds.length });
+});
+
+app.post("/api/playlists/:id/artwork", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) {
+    res.status(400).json({ error: "Invalid playlist id" });
+    return;
+  }
+  const playlist = db
+    .prepare("SELECT id, slug, name, artwork_path FROM playlists WHERE id = ?")
+    .get(id) as { id: number; slug: string; name: string; artwork_path: string } | undefined;
+  if (!playlist) {
+    res.status(404).json({ error: "Playlist not found" });
+    return;
+  }
+  const imageUrl = "https://picsum.photos/1200";
+  const rendered = await renderPlaylistArtwork(playlist.name, imageUrl);
+  const newSignature = hashText(`${playlistArtworkRenderVersion}|${playlist.slug}|${playlist.name}|cover-only|${Date.now()}`);
+  const fileName = `${sanitizeFilename(playlist.slug)}-${newSignature.slice(0, 12)}.jpg`;
+  const localPath = path.join(generatedArtworkDir, fileName);
+  fs.writeFileSync(localPath, rendered);
+  if (playlist.artwork_path) {
+    const previousFile = path.join(generatedArtworkDir, path.basename(playlist.artwork_path));
+    if (fs.existsSync(previousFile)) fs.unlinkSync(previousFile);
+  }
+  updatePlaylistArtworkStmt.run({
+    id: playlist.id,
+    artwork_path: `/generated-artwork/${fileName}`,
+    artwork_attribution: "",
+    artwork_attribution_url: "",
+    artwork_signature: newSignature,
+    artwork_updated_at: new Date().toISOString()
+  });
+  const connection = resolveConnection(req.body?.connection ?? req.body);
+  if (connection) {
+    const token = await navidromeLogin(connection);
+    const remoteList = await subsonicRequest<{ playlists?: { playlist?: Array<{ id: string; name: string }> } }>(connection, "getPlaylists.view");
+    const remoteId = remoteList.playlists?.playlist?.find((p) => p.name === playlist.name)?.id;
+    if (remoteId) {
+      await uploadNavidromePlaylistArtwork(connection, remoteId, token, rendered, fileName);
+    }
+  }
+  res.json({ ok: true, artworkUrl: `/generated-artwork/${fileName}` });
+});
+
+app.post("/api/playlists/filter", async (req, res) => {
+  const name = String(req.body?.name ?? "").trim();
+  const filters = req.body?.filters;
+  if (!name || !filters || typeof filters !== "object") {
+    res.status(400).json({ error: "Name and filters are required" });
+    return;
+  }
+  const now = new Date().toISOString();
+  const slug = `filter-${sanitizeSlug(name)}-${Date.now().toString(36)}`;
+  const description = buildFilterDescription(filters);
+  let playlistId = 0;
+  const tracks = db
+    .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at, play_count, favorite FROM tracks")
+    .all() as TrackRecord[];
+  const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
+  const enriched = syncableTracks.map((track) => ({
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+    year: track.year,
+    tags_json: track.tags_json,
+    audio_features_json: track.audio_features_json,
+    tags: tagsFromTrack(track)
+  }));
+  const filterPool = enriched.filter((track) => {
+    if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
+      const needles = (filters.selectedTags as string[]).map((t) => String(t).toLowerCase());
+      if (!needles.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
+    }
+    if (typeof filters.bpmMin === "number" && !Number.isNaN(filters.bpmMin as number)) {
+      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+      if ((af?.bpm ?? 0) < (filters.bpmMin as number)) return false;
+    }
+    if (typeof filters.bpmMax === "number" && !Number.isNaN(filters.bpmMax as number)) {
+      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+      if ((af?.bpm ?? 0) > (filters.bpmMax as number)) return false;
+    }
+    if (typeof filters.keyQuery === "string" && filters.keyQuery) {
+      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+      const qk = (filters.keyQuery as string).toLowerCase();
+      if (!(af?.key ?? "").toLowerCase().includes(qk) && !(af?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
+    }
+    if (typeof filters.keyMode === "string" && filters.keyMode) {
+      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+      const key = (af?.key ?? "").toLowerCase();
+      const isMinor = key.includes("m") && !key.includes("major");
+      const isMajor = key && !isMinor;
+      if (filters.keyMode === "minor" && !isMinor) return false;
+      if (filters.keyMode === "major" && !isMajor) return false;
+    }
+    if (typeof filters.energyMin === "number" && !Number.isNaN(filters.energyMin as number)) {
+      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+      if ((af?.energy ?? 0) * 100 < (filters.energyMin as number)) return false;
+    }
+    if (typeof filters.energyMax === "number" && !Number.isNaN(filters.energyMax as number)) {
+      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
+      if ((af?.energy ?? 0) * 100 > (filters.energyMax as number)) return false;
+    }
+    if (typeof filters.yearMin === "number" && !Number.isNaN(filters.yearMin as number)) {
+      if ((track.year ?? 0) < (filters.yearMin as number)) return false;
+    }
+    if (typeof filters.yearMax === "number" && !Number.isNaN(filters.yearMax as number)) {
+      if ((track.year ?? 0) > (filters.yearMax as number)) return false;
+    }
+    return true;
+  });
+  const cappedTrackIds = filterPool.slice(0, settings.maxTracksPerPlaylist).map((t) => t.id);
+  const artworkPath = await renderFilterPlaylistArtwork(slug, name, cappedTrackIds);
+  db.transaction(() => {
+    const result = insertPlaylistStmt.run({
+      slug,
+      name,
+      description,
+      created_at: now,
+      updated_at: now,
+      mode: "pinned",
+      selected: 0,
+      sync_target: "subsonic",
+      is_recommended: 1
+    });
+    playlistId = Number(result.lastInsertRowid);
+    db.prepare("UPDATE playlists SET filter_json = ? WHERE id = ?").run(JSON.stringify(filters), playlistId);
+    if (artworkPath) {
+      const signature = hashText(`${playlistArtworkRenderVersion}|${slug}|${name}|pinned|${cappedTrackIds.join(",")}`);
+      db.prepare("UPDATE playlists SET artwork_path = ?, artwork_signature = ?, artwork_updated_at = ? WHERE id = ?").run(artworkPath, signature, now, playlistId);
+    }
+    cappedTrackIds.forEach((trackId, position) => {
+      insertPlaylistTrackStmt.run(playlistId, trackId, position + 1);
+    });
+  })();
+  appendLog({
+    level: "info",
+    scope: "playlist",
+    message: `Filter playlist created`,
+    meta: { id: playlistId, name, tracks: cappedTrackIds.length }
+  });
+  const connection = resolveConnection(req.body?.connection ?? req.body);
+  if (connection) {
+    await syncSinglePlaylist(connection, playlistId, now);
+  }
+  res.json({ ok: true, id: playlistId, name, slug });
+});
+
+async function renderFilterPlaylistArtwork(slug: string, title: string, trackIds: number[]): Promise<string> {
+  if (!trackIds.length) return "";
+  try {
+    const imageUrl = "https://picsum.photos/1200";
+    const rendered = await renderPlaylistArtwork(title, imageUrl);
+    const signature = hashText(`${playlistArtworkRenderVersion}|${slug}|${title}|pinned|${trackIds.join(",")}`);
+    const fileName = `${sanitizeFilename(slug)}-${signature.slice(0, 12)}.jpg`;
+    const localPath = path.join(generatedArtworkDir, fileName);
+    fs.writeFileSync(localPath, rendered);
+    return `/generated-artwork/${fileName}`;
+  } catch {
+    return "";
+  }
+}
+
+function sanitizeSlug(input: string): string {
+  return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
+}
+
+function buildFilterDescription(filters: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
+    parts.push((filters.selectedTags as string[]).join(", "));
+  }
+  if (typeof filters.bpmMin === "number" && !Number.isNaN(filters.bpmMin as number)) {
+    parts.push(`BPM ≥ ${filters.bpmMin}`);
+  }
+  if (typeof filters.bpmMax === "number" && !Number.isNaN(filters.bpmMax as number)) {
+    parts.push(`BPM ≤ ${filters.bpmMax}`);
+  }
+  if (typeof filters.keyQuery === "string" && filters.keyQuery) {
+    parts.push(`key: ${filters.keyQuery}`);
+  }
+  if (typeof filters.keyMode === "string" && filters.keyMode) {
+    parts.push(filters.keyMode as string);
+  }
+  if (typeof filters.energyMin === "number" && !Number.isNaN(filters.energyMin as number)) {
+    parts.push(`energy ≥ ${filters.energyMin}%`);
+  }
+  if (typeof filters.energyMax === "number" && !Number.isNaN(filters.energyMax as number)) {
+    parts.push(`energy ≤ ${filters.energyMax}%`);
+  }
+  if (typeof filters.yearMin === "number" && !Number.isNaN(filters.yearMin as number)) {
+    parts.push(`${filters.yearMin}–`);
+  }
+  if (typeof filters.yearMax === "number" && !Number.isNaN(filters.yearMax as number)) {
+    parts.push(`–${filters.yearMax}`);
+  }
+  return parts.join(" · ") || "Filter playlist";
+}
 
 app.post("/api/playlists/apply", async (req, res) => {
   try {
