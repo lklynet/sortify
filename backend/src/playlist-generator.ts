@@ -183,20 +183,6 @@ function titleCaseWords(value: string): string {
     .join(" ");
 }
 
-function vibePrefix(audioVector: number[]): string {
-  const energy = audioVector[1] ?? 0;
-  const valence = audioVector[3] ?? 0;
-  const acousticness = audioVector[4] ?? 0;
-  const instrumentalness = audioVector[5] ?? 0;
-  if (energy > 0.66) return "Drive";
-  if (energy < 0.35) return "Calm";
-  if (valence > 0.64) return "Bright";
-  if (valence < 0.36) return "Moody";
-  if (acousticness > 0.62) return "Warm";
-  if (instrumentalness > 0.62) return "Textural";
-  return "";
-}
-
 function formatTopTags(tags: string[], count: number): string {
   const formatted = tags
     .slice(0, count)
@@ -213,7 +199,6 @@ function buildPlaylistName(input: {
   moodName?: string;
 }): { name: string; description: string } {
   const description = input.signatureTags.slice(0, 3).join(", ");
-  const prefix = vibePrefix(input.audioVector);
 
   if (input.source === "artist") {
     const artist = input.seedArtist ?? "Artist";
@@ -227,19 +212,12 @@ function buildPlaylistName(input: {
 
   const tagLine = formatTopTags(input.signatureTags, 2);
   if (!tagLine) {
-    return { name: prefix || "Mixed", description };
+    return { name: "Mixed", description };
   }
 
   if (input.source === "mood") {
     const moodName = input.moodName ?? input.signatureTags[0] ? titleCaseWords(input.signatureTags[0]) : "Mood";
-    if (prefix) {
-      return { name: `${moodName} — ${tagLine}`, description };
-    }
-    return { name: `${moodName} ${tagLine}`, description };
-  }
-
-  if (prefix) {
-    return { name: `${prefix}: ${tagLine}`, description };
+    return { name: moodName, description };
   }
 
   return { name: tagLine, description };
