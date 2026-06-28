@@ -181,6 +181,33 @@ h3 {
   line-height: 1;
 }
 
+.panel-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.searchInput {
+  width: 180px;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-size: 0.8rem;
+  outline: none;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.searchInput::placeholder {
+  color: rgba(255, 255, 255, 0.25);
+}
+
+.searchInput:focus {
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.07);
+}
+
 .panel-content {
   padding: 1.05rem 1.1rem;
 }
@@ -287,7 +314,6 @@ button {
 
 button:hover:not(:disabled) {
   background: var(--accent-hover);
-  transform: translateY(-1px);
 }
 
 button:disabled {
@@ -525,19 +551,30 @@ button:disabled {
   background: rgba(143, 155, 173, 0.34);
 }
 
-.trackList li,
+.trackList li {
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  padding: 0;
+}
+
+.trackList li:last-child {
+  border-bottom: none;
+}
+
+.trackList li:hover {
+  background: transparent;
+}
+
 .playlistList li {
   border-bottom: 1px solid var(--line);
   padding: 0.9rem 1.05rem;
   background: transparent;
 }
 
-.trackList li:last-child,
 .playlistList li:last-child {
   border-bottom: none;
 }
 
-.trackList li:hover,
 .playlistList li:hover {
   background: rgba(255, 255, 255, 0.03);
 }
@@ -626,6 +663,64 @@ button:disabled {
   font-size: 0.72rem;
 }
 
+.trackRow {
+  cursor: pointer;
+  padding: 0.9rem 1rem;
+  border-bottom: 1px solid var(--line);
+  transition: background 120ms ease;
+}
+
+.trackRow:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.trackRowExpanded {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.trackRow .trackHead {
+  margin-bottom: 0;
+}
+
+.trackDetail {
+  padding: 0.6rem 1rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.trackDetailSection {
+  margin-top: 0.65rem;
+}
+
+.trackDetailSection strong {
+  display: block;
+  font-size: 0.675rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.trackDetailSection p {
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.trackDetailSection .analysisMetrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+}
+
+.trackDetailSection .analysisMetrics span {
+  color: var(--text);
+  font-size: 0.82rem;
+}
+
+.trackDetailSection .analysisFallback {
+  margin-top: 0;
+}
+
 .playlistHead {
   display: flex;
   justify-content: space-between;
@@ -640,6 +735,13 @@ button:disabled {
   align-items: start;
 }
 
+.playlistArtworkWrap {
+  position: relative;
+  width: 108px;
+  height: 108px;
+  flex-shrink: 0;
+}
+
 .playlistArtwork {
   width: 108px;
   height: 108px;
@@ -647,6 +749,39 @@ button:disabled {
   border-radius: 1rem;
   display: block;
   background: linear-gradient(135deg, rgba(84, 160, 255, 0.35), rgba(255, 107, 107, 0.25));
+}
+
+.playlistArtworkOverlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 1rem;
+  background: rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.playlistArtworkWrap:hover .playlistArtworkOverlay {
+  opacity: 1;
+}
+
+.playlistArtworkRefreshBtn {
+  width: 2.2rem;
+  height: 2.2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  border-radius: 50%;
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+}
+.playlistArtworkRefreshBtn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.5);
 }
 
 .playlistArtworkFallback {
@@ -674,10 +809,10 @@ button:disabled {
 .playlistTopRow > div {
   flex: 1 1 auto;
   min-width: 0;
-  padding-right: 2.5rem;
+  padding-right: 6.5rem;
 }
 
-.playlistModeToggle {
+.playlistRefreshBtn {
   width: 2rem;
   height: 2rem;
   padding: 0;
@@ -687,28 +822,59 @@ button:disabled {
   font-size: 0.94rem;
   position: absolute;
   top: 0;
-  right: 0;
-}
-
-.playlistModeIcon {
-  width: 0.95rem;
-  height: 0.95rem;
-}
-
-.playlistModeToggle.dynamic {
+  right: 4.75rem;
   color: var(--text-muted);
 }
+.playlistRefreshBtn:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
 
-.playlistModeToggle.pinned {
+.playlistPinBtn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.94rem;
+  position: absolute;
+  top: 0;
+  right: 2.25rem;
+  color: var(--text-muted);
+  border-color: transparent;
+  background: transparent;
+}
+.playlistPinBtn.pinned {
   color: #dbe7ff;
   border-color: rgba(41, 121, 255, 0.4);
   background: rgba(41, 121, 255, 0.12);
 }
 
-.playlistModeToggle.locked {
-  color: #ffe6b2;
-  border-color: rgba(181, 127, 36, 0.45);
-  background: rgba(181, 127, 36, 0.16);
+.playlistDeleteBtn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.94rem;
+  font-weight: 300;
+  position: absolute;
+  top: 0;
+  right: 0;
+  color: rgba(255, 100, 100, 0.65);
+  border-color: rgba(255, 100, 100, 0.2);
+}
+.playlistDeleteBtn:hover:not(:disabled) {
+  color: rgba(255, 140, 140, 0.9);
+  border-color: rgba(255, 100, 100, 0.45);
+  background: rgba(255, 100, 100, 0.08);
+}
+
+.playlistPinIcon {
+  width: 0.95rem;
+  height: 0.95rem;
 }
 
 .playlistList p {
@@ -885,6 +1051,164 @@ button:disabled {
   color: var(--text);
 }
 
+.filterPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.filterControls {
+  padding: 0.85rem 1.05rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.filterRow {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.filterRow:last-child {
+  margin-bottom: 0;
+}
+
+.filterInput {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-size: 0.78rem;
+  outline: none;
+  transition: border-color 140ms ease;
+}
+
+.filterInput::placeholder {
+  color: rgba(255, 255, 255, 0.22);
+}
+
+.filterInput:focus {
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.filterInputSmall {
+  flex: 1 1 0;
+  min-width: 80px;
+}
+
+.filterInputSmall::-webkit-inner-spin-button,
+.filterInputSmall::-webkit-outer-spin-button {
+  display: none;
+}
+
+.filterInputKeyMode {
+  max-width: 110px;
+  flex: 0 0 auto;
+}
+
+.tagInputWrap {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  transition: border-color 140ms ease;
+  position: relative;
+}
+
+.tagInputWrap:focus-within {
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.tagInputField {
+  border: none !important;
+  background: transparent !important;
+  flex: 1 1 0;
+  min-width: 80px;
+  padding: 0.15rem 0.2rem !important;
+}
+
+.tagInputField:focus {
+  border-color: transparent !important;
+}
+
+.tagBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(41, 121, 255, 0.18);
+  color: #bdd4fe;
+  font-size: 0.72rem;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease;
+}
+
+.tagBadge:hover {
+  background: rgba(255, 80, 80, 0.25);
+  color: #ffb0b0;
+}
+
+.tagBadge span {
+  font-size: 0.85rem;
+  line-height: 1;
+  opacity: 0.6;
+}
+
+.tagSuggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 2px;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #1a1a24;
+  max-height: 180px;
+  overflow-y: auto;
+  z-index: 10;
+}
+
+.tagSuggestion {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.76rem;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 100ms ease;
+}
+
+.tagSuggestion:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.filterCount {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 0.5rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.filterSaveBtn {
+  padding: 0.4rem 0.7rem;
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
+.filterResults {
+  flex: 1;
+}
+
 @media (max-width: 1100px) {
   .content-grid {
     grid-template-columns: 1fr;
@@ -921,17 +1245,28 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
+  .playlistArtworkWrap {
+    width: 100%;
+    height: auto;
+  }
+
   .playlistArtwork {
     width: 100%;
     height: auto;
     aspect-ratio: 1 / 1;
   }
 
+  .playlistTopRow {
+    flex-wrap: wrap;
+  }
+
   .playlistTopRow > div {
     padding-right: 0;
   }
 
-  .playlistModeToggle {
+  .playlistRefreshBtn,
+  .playlistPinBtn,
+  .playlistDeleteBtn {
     position: static;
   }
 

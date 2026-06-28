@@ -22,7 +22,7 @@ function escapeXml(value: string): string {
 }
 
 function estimateTextWidth(text: string, fontSize: number) {
-  return text.length * fontSize * 0.64;
+  return text.length * fontSize * 0.56;
 }
 
 function dedupeAdjacentWords(value: string): string {
@@ -59,39 +59,37 @@ function wrapTitleWords(words: string[], maxWidth: number, fontSize: number): st
 
 function layoutTitle(lines: string[]) {
   const safeLines = lines.length ? lines : ["Untitled", "Playlist"];
-  const maxWidth = 1000;
-  const maxHeight = 1080;
-  const fontSize = 130;
-  const lineHeight = Math.round(fontSize * 0.9);
-  const wrapped = wrapTitleWords(safeLines, maxWidth, fontSize);
-  const blockHeight = fontSize + (wrapped.length - 1) * lineHeight;
-  if (blockHeight <= maxHeight) {
-    return { fontSize, lineHeight, blockHeight, lines: wrapped };
+  const maxWidth = 1200 - 72 * 2;
+  const maxHeight = 1200 - 144;
+  let fontSize = 132;
+  let lineHeight: number;
+  let wrapped: string[];
+  let blockHeight: number;
+  while (true) {
+    lineHeight = Math.round(fontSize * 1.05);
+    wrapped = wrapTitleWords(safeLines, maxWidth, fontSize);
+    blockHeight = fontSize + (wrapped.length - 1) * lineHeight;
+    if (blockHeight <= maxHeight) break;
+    fontSize -= 2;
+    if (fontSize <= 24) break;
   }
-  const fallbackSize = 96;
-  const fallbackLineHeight = Math.round(fallbackSize * 0.9);
-  const fallbackWrapped = wrapTitleWords(safeLines, maxWidth, fallbackSize);
-  const fallbackBlock = fallbackSize + (fallbackWrapped.length - 1) * fallbackLineHeight;
-  return { fontSize: fallbackSize, lineHeight: fallbackLineHeight, blockHeight: fallbackBlock, lines: fallbackWrapped };
+  return { fontSize, lineHeight, blockHeight, lines: wrapped };
 }
 
-async function renderArtworkTitleOverlay(lines: string[], textColor: string) {
+async function renderArtworkTitleOverlay(lines: string[]) {
   const layout = layoutTitle(lines);
   const firstBaseline = (1200 - layout.blockHeight) / 2 + layout.fontSize;
   const leftInset = 72;
+  const tspans = layout.lines
+    .map((line, index) =>
+      index === 0
+        ? escapeXml(line)
+        : `<tspan x="${leftInset}" dy="${layout.lineHeight}">${escapeXml(line)}</tspan>`
+    )
+    .join("");
   const svg = `
     <svg width="1200" height="1200" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
-          <feDropShadow dx="3" dy="4" stdDeviation="5" flood-color="#000000" flood-opacity="0.55"/>
-        </filter>
-      </defs>
-      ${layout.lines
-        .map(
-          (line, index) =>
-            `<text x="${leftInset}" y="${firstBaseline + index * layout.lineHeight}" text-anchor="start" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="${layout.fontSize}" font-weight="900" letter-spacing="-1.8" fill="${textColor}" filter="url(#shadow)">${escapeXml(line)}</text>`
-        )
-        .join("")}
+      <text x="${leftInset}" y="${firstBaseline}" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="${layout.fontSize}" font-weight="900" letter-spacing="-1.8" fill="#ffffff">${tspans}</text>
     </svg>
   `;
   return sharp(Buffer.from(svg)).png().toBuffer();
@@ -146,58 +144,27 @@ async function fetchBuffer(url: string, init?: RequestInit): Promise<Buffer> {
   return Buffer.from(await response.arrayBuffer());
 }
 
-export async function isUsableArtworkImage(imageUrl: string): Promise<boolean> {
-  try {
-    const source = await fetchBuffer(imageUrl, { signal: AbortSignal.timeout(8000) });
-    const image = sharp(source, { failOn: "none" });
-    const metadata = await image.metadata();
-    if (!metadata.width || !metadata.height || metadata.width < 300 || metadata.height < 300) {
-      return false;
-    }
-    const stats = await image.stats();
-    const meanSpread =
-      Math.abs(stats.channels[0]?.mean - stats.channels[1]?.mean)
-      + Math.abs(stats.channels[1]?.mean - stats.channels[2]?.mean)
-      + Math.abs(stats.channels[0]?.mean - stats.channels[2]?.mean);
-    const luminanceRange =
-      Math.max(stats.channels[0]?.max ?? 0, stats.channels[1]?.max ?? 0, stats.channels[2]?.max ?? 0)
-      - Math.min(stats.channels[0]?.min ?? 255, stats.channels[1]?.min ?? 255, stats.channels[2]?.min ?? 255);
-    const averageMean = ((stats.channels[0]?.mean ?? 0) + (stats.channels[1]?.mean ?? 0) + (stats.channels[2]?.mean ?? 0)) / 3;
-    const averageStdev = ((stats.channels[0]?.stdev ?? 0) + (stats.channels[1]?.stdev ?? 0) + (stats.channels[2]?.stdev ?? 0)) / 3;
-    if ((luminanceRange < 18 && meanSpread < 12) || (averageMean > 205 && averageStdev < 18)) {
-      return false;
-    }
-    return true;
-  } catch {
-    log.debug("artwork usability check failed", { imageUrl });
-    return false;
-  }
-}
-
 export async function renderPlaylistArtwork(title: string, imageUrl: string) {
   const cleanTitle = dedupeAdjacentWords(title) || "Untitled Playlist";
   const source = await fetchBuffer(imageUrl);
   const sourceColors = await extractSourceColors(source);
-  const base = sharp(source).resize(1200, 1200, { fit: "cover", position: "attention" }).ensureAlpha();
+  const base = sharp(source, { animated: false }).resize(1200, 1200, { fit: "cover", position: "attention" }).ensureAlpha();
   const toneMap = await base
     .clone()
+    .grayscale()
     .normalize()
     .linear(1.5, -36)
     .gamma(1.12)
     .raw()
     .toBuffer();
-  const mappedPixels = Buffer.alloc(1200 * 1200 * 4);
-  for (let index = 0; index < toneMap.length; index += 4) {
-    const r = toneMap[index];
-    const g = toneMap[index + 1];
-    const b = toneMap[index + 2];
-    const luminance = Math.max(0, Math.min(1, (0.299 * r + 0.587 * g + 0.114 * b) / 255));
-    const mappedLuminance = Math.pow(luminance, 0.85);
-    const offset = index;
+  const mappedPixels = Buffer.alloc(1200 * 1200 * 3);
+  for (let index = 0; index < toneMap.length; index++) {
+    const luminance = Math.max(0, Math.min(1, toneMap[index] / 255));
+    const mappedLuminance = 0.05 + luminance ** 1.38 * 0.32;
+    const offset = index * 3;
     mappedPixels[offset] = Math.round(sourceColors.darkR + (sourceColors.lightR - sourceColors.darkR) * mappedLuminance);
     mappedPixels[offset + 1] = Math.round(sourceColors.darkG + (sourceColors.lightG - sourceColors.darkG) * mappedLuminance);
     mappedPixels[offset + 2] = Math.round(sourceColors.darkB + (sourceColors.lightB - sourceColors.darkB) * mappedLuminance);
-    mappedPixels[offset + 3] = 255;
   }
   const detailLayer = await base
     .clone()
@@ -208,25 +175,26 @@ export async function renderPlaylistArtwork(title: string, imageUrl: string) {
     .png()
     .toBuffer();
   const mappedImage = await sharp(mappedPixels, {
-    raw: { width: 1200, height: 1200, channels: 4 }
+    raw: { width: 1200, height: 1200, channels: 3 }
   })
     .png()
     .toBuffer();
-  const midpointLuminance = (
-    (sourceColors.darkR + sourceColors.lightR) / 2 * 0.299 +
-    (sourceColors.darkG + sourceColors.lightG) / 2 * 0.587 +
-    (sourceColors.darkB + sourceColors.lightB) / 2 * 0.114
-  );
-  const textColor = midpointLuminance > 110 ? "#111111" : "#ffffff";
-  const titleOverlay = await renderArtworkTitleOverlay(cleanTitle.split(/\s+/).filter(Boolean), textColor);
+  const darkWash = await sharp({
+    create: { width: 1200, height: 1200, channels: 4, background: { r: 20, g: 12, b: 18, alpha: 0.18 } }
+  })
+    .png()
+    .toBuffer();
+  const titleOverlay = await renderArtworkTitleOverlay(cleanTitle.split(/\s+/).filter(Boolean));
   return sharp({
     create: { width: 1200, height: 1200, channels: 4, background: "#000000" }
   })
     .composite([
       { input: mappedImage, blend: "over" },
-      { input: detailLayer, blend: "soft-light" },
+      { input: detailLayer, blend: "overlay" },
+      { input: darkWash, blend: "multiply" },
       { input: titleOverlay, blend: "over" }
     ])
+    .linear(0.96, -10)
     .jpeg({ quality: 90, mozjpeg: true })
     .toBuffer();
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Lock, Pin, RefreshCw } from "lucide-react";
+import { Pin } from "lucide-react";
 import "./App.css";
 
 type Stats = { tracks: number; playlists: number; analyzedTracks: number };
@@ -29,7 +29,7 @@ type Playlist = {
   slug: string;
   name: string;
   description: string;
-  mode: "dynamic" | "pinned" | "locked";
+  mode: "dynamic" | "pinned";
   updated_at: string;
   artworkUrl: string | null;
   artworkAttribution: string | null;
@@ -133,24 +133,6 @@ function hasAudioAnalysis(track: Track) {
   return Boolean(track.audioFeatures && Array.isArray(track.audioFeatures.moodTags));
 }
 
-const playlistModeOptions = [
-  { value: "dynamic", label: "Weekly", Icon: RefreshCw, description: "Replaced by Sortify on refresh" },
-  { value: "pinned", label: "Pinned", Icon: Pin, description: "Stays in place and refreshes tracks" },
-  { value: "locked", label: "Locked", Icon: Lock, description: "Stays exactly as it is now" }
-] as const;
-
-function nextPlaylistMode(mode: Playlist["mode"]): Playlist["mode"] {
-  const currentIndex = playlistModeOptions.findIndex((option) => option.value === mode);
-  if (currentIndex < 0) {
-    return "dynamic";
-  }
-  return playlistModeOptions[(currentIndex + 1) % playlistModeOptions.length].value;
-}
-
-function playlistModeMeta(mode: Playlist["mode"]) {
-  return playlistModeOptions.find((option) => option.value === mode) ?? playlistModeOptions[0];
-}
-
 function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>({
@@ -182,14 +164,109 @@ function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
-  const [playlistTab, setPlaylistTab] = useState<"playlists" | "history" | "stats">("playlists");
+  const [playlistTab, setPlaylistTab] = useState<"playlists" | "history" | "stats" | "filter">("playlists");
   const [worker, setWorker] = useState<WorkerState | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [toastEntry, setToastEntry] = useState<OperationLog | null>(null);
   const [confirmRefreshModal, setConfirmRefreshModal] = useState<ConfirmRefreshModal>(null);
   const playlistReorderOnNextLoadRef = useRef(true);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<Track[] | null>(null);
+  const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [allTracks, setAllTracks] = useState<Track[]>([]);
+  const [allTracksLoaded, setAllTracksLoaded] = useState(false);
+  const [filterParams, setFilterParams] = useState({ selectedTags: [] as string[], bpmMin: NaN, bpmMax: NaN, keyQuery: "", keyMode: "" as "" | "major" | "minor", energyMin: NaN, energyMax: NaN, yearMin: NaN, yearMax: NaN });
+  const [tagInputText, setTagInputText] = useState("");
+  const [tagInputFocused, setTagInputFocused] = useState(false);
+  const [savingFilterPlaylist, setSavingFilterPlaylist] = useState(false);
+  const [filterPlaylistName, setFilterPlaylistName] = useState("");
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults(null);
+      return;
+    }
+    setExpandedTrackId(null);
+    const q = searchQuery.trim();
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      callApi<Track[]>(`/api/tracks/search?q=${encodeURIComponent(q)}`)
+        .then(setSearchResults)
+        .catch(() => null);
+    }, 300);
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    };
+  }, [searchQuery]);
   const seenToastIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (playlistTab === "filter" && !allTracksLoaded) {
+      callApi<Track[]>("/api/tracks/all")
+        .then((t) => { setAllTracks(t); setAllTracksLoaded(true); })
+        .catch(() => null);
+    }
+  }, [playlistTab, allTracksLoaded]);
+
+  const tagSuggestions = (() => {
+    const sourceTracks = filterParams.selectedTags.length > 0
+      ? allTracks.filter((t) => filterParams.selectedTags.every((needle) => t.tags.some((tag) => tag.toLowerCase().includes(needle))))
+      : allTracks;
+    const set = new Set<string>();
+    for (const t of sourceTracks) {
+      for (const tag of t.tags) set.add(tag);
+    }
+    const pool = [...set].sort((a, b) => a.localeCompare(b)).filter((t) => !filterParams.selectedTags.includes(t));
+    if (!tagInputText.trim()) return pool.slice(0, 20);
+    const q = tagInputText.toLowerCase();
+    return pool.filter((tag) => tag.toLowerCase().includes(q)).slice(0, 20);
+  })();
+
+  const addTag = (tag: string) => {
+    const clean = tag.trim().toLowerCase();
+    if (!clean) return;
+    setFilterParams((p) => {
+      if (p.selectedTags.includes(clean)) return p;
+      return { ...p, selectedTags: [...p.selectedTags, clean] };
+    });
+    setTagInputText("");
+  };
+
+  const removeTag = (tag: string) => {
+    setFilterParams((p) => ({ ...p, selectedTags: p.selectedTags.filter((t) => t !== tag) }));
+  };
+
+  const filteredTracks = (() => {
+    if (allTracks.length === 0) return allTracks;
+    const p = filterParams;
+    const hasFilters = p.selectedTags.length > 0 || !Number.isNaN(p.bpmMin) || !Number.isNaN(p.bpmMax) || p.keyQuery || p.keyMode || !Number.isNaN(p.energyMin) || !Number.isNaN(p.energyMax) || !Number.isNaN(p.yearMin) || !Number.isNaN(p.yearMax);
+    if (!hasFilters) return allTracks;
+    return allTracks.filter((track) => {
+      if (p.selectedTags.length > 0) {
+        if (!p.selectedTags.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
+      }
+      if (!Number.isNaN(p.bpmMin) && (track.audioFeatures?.bpm ?? 0) < p.bpmMin) return false;
+      if (!Number.isNaN(p.bpmMax) && (track.audioFeatures?.bpm ?? 0) > p.bpmMax) return false;
+      if (p.keyQuery) {
+        const qk = p.keyQuery.toLowerCase();
+        if (!(track.audioFeatures?.key ?? "").toLowerCase().includes(qk) && !(track.audioFeatures?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
+      }
+      if (p.keyMode) {
+        const key = (track.audioFeatures?.key ?? "").toLowerCase();
+        const isKeyMinor = key.includes("m") && !key.includes("major");
+        const isKeyMajor = key && !isKeyMinor;
+        if (p.keyMode === "minor" && !isKeyMinor) return false;
+        if (p.keyMode === "major" && !isKeyMajor) return false;
+      }
+      if (!Number.isNaN(p.energyMin) && (track.audioFeatures?.energy ?? 0) * 100 < p.energyMin) return false;
+      if (!Number.isNaN(p.energyMax) && (track.audioFeatures?.energy ?? 0) * 100 > p.energyMax) return false;
+      if (!Number.isNaN(p.yearMin) && (track.year ?? 0) < p.yearMin) return false;
+      if (!Number.isNaN(p.yearMax) && (track.year ?? 0) > p.yearMax) return false;
+      return true;
+    });
+  })();
   const hasLoadedLogsRef = useRef(false);
 
   const hasNavidromePassword = Boolean(settingsDraft.navidromePassword.trim() || settingsDraft.hasNavidromePassword);
@@ -399,6 +476,45 @@ function App() {
       });
     });
 
+  const deletePlaylist = (playlistId: number) =>
+    runAction(`playlist-delete-${playlistId}`, async () => {
+      const body = hasSubsonicConnection ? JSON.stringify({ connection: connectionPayload }) : undefined;
+      await callApi(`/api/playlists/${playlistId}`, { method: "DELETE", body });
+      setPlaylists((prev) => prev.filter((p) => p.id !== playlistId));
+    });
+
+  const refreshSinglePlaylist = (playlistId: number) =>
+    runAction(`playlist-refresh-${playlistId}`, async () => {
+      const body = hasSubsonicConnection ? JSON.stringify({ connection: connectionPayload }) : undefined;
+      await callApi(`/api/playlists/${playlistId}/refresh`, { method: "POST", body });
+      playlistReorderOnNextLoadRef.current = true;
+      const fetched = await callApi<Playlist[]>("/api/playlists");
+      if (fetched) setPlaylists(fetched);
+    });
+
+  const regenerateArtwork = (playlistId: number) =>
+    runAction(`artwork-${playlistId}`, async () => {
+      const body = hasSubsonicConnection ? JSON.stringify({ connection: connectionPayload }) : undefined;
+      const result = await callApi<{ artworkUrl: string }>(`/api/playlists/${playlistId}/artwork`, { method: "POST", body });
+      if (result?.artworkUrl) {
+        setPlaylists((prev) => prev.map((p) => p.id === playlistId ? { ...p, artworkUrl: result.artworkUrl } : p));
+      }
+    });
+
+  const saveFilterPlaylist = (name: string) =>
+    runAction("save-filter-playlist", async () => {
+      const payload: Record<string, unknown> = { name, filters: filterParams };
+      if (hasSubsonicConnection) payload.connection = connectionPayload;
+      await callApi("/api/playlists/filter", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      setSavingFilterPlaylist(false);
+      setFilterPlaylistName("");
+      const fetched = await callApi("/api/playlists");
+      if (fetched) setPlaylists(fetched);
+    });
+
   const openRefreshConfirmation = (action: "analysis" | "playlists") => {
     setConfirmRefreshModal(
       action === "analysis"
@@ -543,13 +659,13 @@ function App() {
                       id="weeklyPlaylistCount"
                       value={settingsDraft.weeklyPlaylistCount}
                       onChange={(event) => {
-                        setSettingsDraft((prev) => ({ ...prev, weeklyPlaylistCount: Math.max(1, Math.min(8, Number(event.target.value))) }));
+                        setSettingsDraft((prev) => ({ ...prev, weeklyPlaylistCount: Math.max(0, Math.min(8, Number(event.target.value))) }));
                         setSettingsDirty(true);
                       }}
                     >
-                      {[1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
+                      {[0, 1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
                         <option key={count} value={count}>
-                          {count}
+                          {count === 0 ? "None" : count}
                         </option>
                       ))}
                     </select>
@@ -637,61 +753,112 @@ function App() {
         <article className="panel">
           <div className="panel-header panel-header-actions">
             <h3>Recently tagged tracks</h3>
-            <button
-              className="ghost-button icon-button"
-              onClick={() => openRefreshConfirmation("analysis")}
-              disabled={!hasSubsonicConnection || busyAction !== null}
-              aria-label="Force refresh analysis"
-              title="Force refresh analysis"
-            >
-              {busyAction === "refresh-analysis" ? "…" : "↻"}
-            </button>
+            <div className="panel-header-right">
+              <input
+                className="searchInput"
+                type="search"
+                placeholder="Search tracks…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              <button
+                className="ghost-button icon-button"
+                onClick={() => openRefreshConfirmation("analysis")}
+                disabled={!hasSubsonicConnection || busyAction !== null}
+                aria-label="Force refresh analysis"
+                title="Force refresh analysis"
+              >
+                {busyAction === "refresh-analysis" ? "…" : "↻"}
+              </button>
+            </div>
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
-            <ul className="trackList">
-              {tracks.map((track) => (
-                <li key={track.id}>
-                  {(() => {
+            {(() => {
+              const displayTracks = searchResults ?? tracks;
+              if (searchResults !== null && displayTracks.length === 0) {
+                return <p className="emptyState">No tracks found for "{searchQuery}".</p>;
+              }
+              return (
+                <ul className="trackList">
+                  {displayTracks.map((track) => {
+                    const expanded = expandedTrackId === track.id;
                     const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
                     return (
-                      <>
-                  <div className="trackHead">
-                    <div>
-                      <strong>{track.title || "Unknown Title"}</strong>
-                      <span>
-                        {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
-                      </span>
-                    </div>
-                    <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
-                      {analysis ? "Analyzed" : "Metadata only"}
-                    </span>
-                  </div>
-                  <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
-                  {analysis ? (
-                    <div className="analysisBlock">
-                      <div className="analysisMetrics">
-                        <span>{formatBpm(analysis.bpm)}</span>
-                        <span>Energy {formatPercent(analysis.energy)}</span>
-                        <span>Dance {formatPercent(analysis.danceability)}</span>
-                        <span>Valence {formatPercent(analysis.valence)}</span>
-                      </div>
-                      <div className="analysisTags">
-                        {(analysis.moodTags ?? []).slice(0, 4).map((tag) => (
-                          <span key={tag}>{tag}</span>
-                        ))}
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="analysisFallback">
-                      Audio analysis is not available for this track yet.
-                    </p>
-                  )}
-                      </>
+                      <li key={track.id}>
+                        <div
+                          className={`trackRow ${expanded ? "trackRowExpanded" : ""}`}
+                          onClick={() => setExpandedTrackId(expanded ? null : track.id)}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpandedTrackId(expanded ? null : track.id); } }}
+                        >
+                          <div className="trackHead">
+                            <div>
+                              <strong>{track.title || "Unknown Title"}</strong>
+                              <span>
+                                {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
+                              </span>
+                            </div>
+                            <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
+                              {analysis ? "Analyzed" : "Metadata"}
+                            </span>
+                          </div>
+                          <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
+                        </div>
+                        {expanded && (
+                          <div className="trackDetail">
+                            {track.tags.length > 0 && (
+                              <div className="trackDetailSection">
+                                <strong>Tags</strong>
+                                <p>{track.tags.join(" · ")}</p>
+                              </div>
+                            )}
+                            {analysis ? (
+                              <>
+                                <div className="trackDetailSection">
+                                  <strong>Audio Features</strong>
+                                  <div className="analysisMetrics">
+                                    <span>{formatBpm(analysis.bpm)}</span>
+                                    <span>Energy {formatPercent(analysis.energy)}</span>
+                                    <span>Dance {formatPercent(analysis.danceability)}</span>
+                                    <span>Valence {formatPercent(analysis.valence)}</span>
+                                    <span>Acoustic {formatPercent(analysis.acousticness)}</span>
+                                    <span>Instrumental {formatPercent(analysis.instrumentalness)}</span>
+                                  </div>
+                                </div>
+                                {analysis.key && (
+                                  <div className="trackDetailSection">
+                                    <strong>Key</strong>
+                                    <p>{analysis.key}{analysis.camelotKey ? ` (${analysis.camelotKey})` : ""}{analysis.keyConfidence ? ` · confidence ${formatPercent(analysis.keyConfidence)}` : ""}</p>
+                                  </div>
+                                )}
+                                {analysis.moodTags?.length > 0 && (
+                                  <div className="trackDetailSection">
+                                    <strong>Mood Tags</strong>
+                                    <p>{analysis.moodTags.join(" · ")}</p>
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <div className="trackDetailSection">
+                                <strong>Audio Features</strong>
+                                <p className="analysisFallback">Not available for this track yet.</p>
+                              </div>
+                            )}
+                            {track.year && (
+                              <div className="trackDetailSection">
+                                <strong>Year</strong>
+                                <p>{track.year}</p>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </li>
                     );
-                  })()}
-                </li>
-              ))}
-            </ul>
+                  })}
+                </ul>
+              );
+            })()}
           </div>
         </article>
 
@@ -716,16 +883,24 @@ function App() {
               >
                 Stats
               </button>
+              <button
+                className={`tab ${playlistTab === "filter" ? "active" : ""}`}
+                onClick={() => setPlaylistTab("filter")}
+              >
+                Filter
+              </button>
             </div>
-            <button
-              className="ghost-button icon-button"
-              onClick={() => openRefreshConfirmation("playlists")}
-              disabled={busyAction !== null}
-              aria-label="Force refresh playlists"
-              title="Force refresh playlists"
-            >
-              {busyAction === "refresh-playlists" ? "…" : "↻"}
-            </button>
+            {playlistTab === "playlists" ? (
+              <button
+                className="ghost-button icon-button"
+                onClick={() => openRefreshConfirmation("playlists")}
+                disabled={busyAction !== null}
+                aria-label="Force refresh playlists"
+                title="Force refresh playlists"
+              >
+                {busyAction === "refresh-playlists" ? "…" : "↻"}
+              </button>
+            ) : null}
           </div>
           <div className="panel-content" style={{ padding: 0 }}>
             {playlistTab === "playlists" ? (
@@ -733,13 +908,27 @@ function App() {
               {playlists.map((playlist) => (
                 <li key={playlist.id}>
                   <div className="playlistCard">
-                    {playlist.artworkUrl ? (
-                      <img className="playlistArtwork" src={assetUrl(playlist.artworkUrl)} alt={`${playlist.name} cover art`} />
-                    ) : (
-                      <div className="playlistArtwork playlistArtworkFallback" aria-hidden="true">
-                        {playlist.name.slice(0, 1).toUpperCase()}
+                    <div className="playlistArtworkWrap">
+                      {playlist.artworkUrl ? (
+                        <img className="playlistArtwork" src={assetUrl(playlist.artworkUrl)} alt={`${playlist.name} cover art`} />
+                      ) : (
+                        <div className="playlistArtwork playlistArtworkFallback" aria-hidden="true">
+                          {playlist.name.slice(0, 1).toUpperCase()}
+                        </div>
+                      )}
+                      <div className="playlistArtworkOverlay">
+                        <button
+                          type="button"
+                          className="ghost-button playlistArtworkRefreshBtn"
+                          onClick={(e) => { e.stopPropagation(); regenerateArtwork(playlist.id); }}
+                          disabled={busyAction !== null}
+                          aria-label={`Regenerate cover for ${playlist.name}`}
+                          title="Regenerate cover"
+                        >
+                          {busyAction === `artwork-${playlist.id}` ? "…" : "↻"}
+                        </button>
                       </div>
-                    )}
+                    </div>
                     <div className="playlistBody">
                       <div className="playlistTopRow">
                         <div>
@@ -748,21 +937,41 @@ function App() {
                           </div>
                         </div>
                         {(() => {
-                          const currentMode = playlistModeMeta(playlist.mode);
-                          const nextMode = nextPlaylistMode(playlist.mode);
-                          const nextModeInfo = playlistModeMeta(nextMode);
-                          const actionId = `playlist-mode-${playlist.id}-${nextMode}`;
+                          const isPinned = playlist.mode === "pinned";
+                          const refreshActionId = `playlist-refresh-${playlist.id}`;
                           return (
-                            <button
-                              type="button"
-                              className={`ghost-button playlistModeToggle ${playlist.mode}`}
-                              onClick={() => updatePlaylistMode(playlist.id, nextMode)}
-                              disabled={busyAction !== null}
-                              aria-label={`${playlist.name} mode ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
-                              title={`Mode: ${currentMode.label}. Click to set ${nextModeInfo.label}.`}
-                            >
-                              {busyAction === actionId ? "…" : <currentMode.Icon className="playlistModeIcon" aria-hidden="true" />}
-                            </button>
+                            <>
+                              <button
+                                type="button"
+                                className="ghost-button playlistRefreshBtn"
+                                onClick={() => refreshSinglePlaylist(playlist.id)}
+                                disabled={busyAction !== null}
+                                aria-label={`Refresh ${playlist.name}`}
+                                title={`Refresh ${playlist.name}`}
+                              >
+                                {busyAction === refreshActionId ? "…" : "↻"}
+                              </button>
+                              <button
+                                type="button"
+                                className={`ghost-button playlistPinBtn ${playlist.mode}`}
+                                onClick={() => updatePlaylistMode(playlist.id, isPinned ? "dynamic" : "pinned")}
+                                disabled={busyAction !== null}
+                                aria-label={`${isPinned ? "Unpin" : "Pin"} ${playlist.name}`}
+                                title={isPinned ? "Click to unpin" : "Click to pin"}
+                              >
+                                {busyAction === `playlist-mode-${playlist.id}-${isPinned ? "dynamic" : "pinned"}` ? "…" : <Pin className="playlistPinIcon" aria-hidden="true" />}
+                              </button>
+                              <button
+                                type="button"
+                                className="ghost-button playlistDeleteBtn"
+                                onClick={() => deletePlaylist(playlist.id)}
+                                disabled={busyAction !== null}
+                                aria-label={`Delete playlist ${playlist.name}`}
+                                title="Delete playlist"
+                              >
+                                {busyAction === `playlist-delete-${playlist.id}` ? "…" : "×"}
+                              </button>
+                            </>
                           );
                         })()}
                       </div>
@@ -810,7 +1019,7 @@ function App() {
               ))}
             </ul>
             )
-            ) : (
+            ) : playlistTab === "stats" ? (
               libraryStats ? (
                 <div className="statsPanel">
                   <div className="statSection">
@@ -914,6 +1123,245 @@ function App() {
               ) : (
                 <p className="emptyState">Loading stats…</p>
               )
+            ) : (
+              <>
+              <div className="filterPanel">
+                <div className="filterControls">
+                  <div className="filterRow">
+                    <div className="tagInputWrap">
+                      {filterParams.selectedTags.map((tag) => (
+                        <span key={tag} className="tagBadge" onClick={() => removeTag(tag)} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); removeTag(tag); } }}>
+                          {tag} <span aria-hidden="true">&times;</span>
+                        </span>
+                      ))}
+                      <input
+                        className="filterInput tagInputField"
+                        type="text"
+                        placeholder={filterParams.selectedTags.length ? "" : "Add tags…"}
+                        value={tagInputText}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val.includes(",")) {
+                            const parts = val.split(",").map((s) => s.trim()).filter(Boolean);
+                            for (const part of parts) addTag(part);
+                            return;
+                          }
+                          setTagInputText(val);
+                        }}
+                        onFocus={() => setTagInputFocused(true)}
+                        onBlur={() => setTimeout(() => setTagInputFocused(false), 200)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") { e.preventDefault(); addTag(tagInputText); }
+                          if (e.key === "Backspace" && !tagInputText && filterParams.selectedTags.length) {
+                            removeTag(filterParams.selectedTags[filterParams.selectedTags.length - 1]);
+                          }
+                        }}
+                      />
+                      {(tagInputFocused || tagInputText) && tagSuggestions.length > 0 && (
+                        <div className="tagSuggestions">
+                          {tagSuggestions.map((tag) => (
+                            <div
+                              key={tag}
+                              className="tagSuggestion"
+                              onMouseDown={(e) => { e.preventDefault(); addTag(tag); }}
+                            >
+                              {tag}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <input
+                      className="filterInput"
+                      type="text"
+                      placeholder="Key (e.g. C, 8B)"
+                      value={filterParams.keyQuery}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, keyQuery: e.target.value }))}
+                    />
+                    <select
+                      className="filterInput filterInputKeyMode"
+                      value={filterParams.keyMode}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, keyMode: e.target.value as "" | "major" | "minor" }))}
+                    >
+                      <option value="">Any key</option>
+                      <option value="major">Major</option>
+                      <option value="minor">Minor</option>
+                    </select>
+                    <span className="filterCount">{filteredTracks.length} track{filteredTracks.length !== 1 ? "s" : ""}</span>
+                  </div>
+                  <div className="filterRow">
+                    <input
+                      className="filterInput filterInputSmall"
+                      type="number"
+                      placeholder="BPM min"
+                      value={Number.isNaN(filterParams.bpmMin) ? "" : filterParams.bpmMin}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, bpmMin: e.target.value === "" ? NaN : Number(e.target.value) }))}
+                    />
+                    <input
+                      className="filterInput filterInputSmall"
+                      type="number"
+                      placeholder="BPM max"
+                      value={Number.isNaN(filterParams.bpmMax) ? "" : filterParams.bpmMax}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, bpmMax: e.target.value === "" ? NaN : Number(e.target.value) }))}
+                    />
+                    <input
+                      className="filterInput filterInputSmall"
+                      type="number"
+                      placeholder="Energy min"
+                      min="0"
+                      max="100"
+                      value={Number.isNaN(filterParams.energyMin) ? "" : filterParams.energyMin}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, energyMin: e.target.value === "" ? NaN : Number(e.target.value) }))}
+                    />
+                    <input
+                      className="filterInput filterInputSmall"
+                      type="number"
+                      placeholder="Energy max"
+                      min="0"
+                      max="100"
+                      value={Number.isNaN(filterParams.energyMax) ? "" : filterParams.energyMax}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, energyMax: e.target.value === "" ? NaN : Number(e.target.value) }))}
+                    />
+                    <input
+                      className="filterInput filterInputSmall"
+                      type="number"
+                      placeholder="Year min"
+                      value={Number.isNaN(filterParams.yearMin) ? "" : filterParams.yearMin}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, yearMin: e.target.value === "" ? NaN : Number(e.target.value) }))}
+                    />
+                    <input
+                      className="filterInput filterInputSmall"
+                      type="number"
+                      placeholder="Year max"
+                      value={Number.isNaN(filterParams.yearMax) ? "" : filterParams.yearMax}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, yearMax: e.target.value === "" ? NaN : Number(e.target.value) }))}
+                    />
+                  </div>
+                  {savingFilterPlaylist ? (
+                    <div className="filterRow">
+                      <input
+                        className="filterInput filterInputSmall"
+                        type="text"
+                        placeholder="Playlist name"
+                        value={filterPlaylistName}
+                        onChange={(e) => setFilterPlaylistName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter" && filterPlaylistName.trim()) saveFilterPlaylist(filterPlaylistName.trim()); if (e.key === "Escape") { setSavingFilterPlaylist(false); setFilterPlaylistName(""); } }}
+                        autoFocus
+                      />
+                      <button
+                        className="ghost-button filterSaveBtn"
+                        disabled={!filterPlaylistName.trim() || busyAction !== null}
+                        onClick={() => saveFilterPlaylist(filterPlaylistName.trim())}
+                      >
+                        {busyAction === "save-filter-playlist" ? "…" : "Save"}
+                      </button>
+                      <button
+                        className="ghost-button filterSaveBtn"
+                        onClick={() => { setSavingFilterPlaylist(false); setFilterPlaylistName(""); }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="filterRow">
+                      <button
+                        className="ghost-button filterSaveBtn"
+                        disabled={filteredTracks.length === 0 || busyAction !== null}
+                        onClick={() => setSavingFilterPlaylist(true)}
+                      >
+                        Save as Playlist
+                      </button>
+                    </div>
+                  )}
+                </div>
+                </div>
+                <div className="filterResults">
+                  {!allTracksLoaded ? (
+                    <p className="emptyState">Loading tracks…</p>
+                  ) : filteredTracks.length === 0 ? (
+                    <p className="emptyState">No tracks match these filters.</p>
+                  ) : (
+                    <ul className="trackList">
+                      {filteredTracks.map((track) => {
+                        const expanded = expandedTrackId === track.id;
+                        const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
+                        return (
+                          <li key={track.id}>
+                            <div
+                              className={`trackRow ${expanded ? "trackRowExpanded" : ""}`}
+                              onClick={() => setExpandedTrackId(expanded ? null : track.id)}
+                              role="button"
+                              tabIndex={0}
+                              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpandedTrackId(expanded ? null : track.id); } }}
+                            >
+                              <div className="trackHead">
+                                <div>
+                                  <strong>{track.title || "Unknown Title"}</strong>
+                                  <span>
+                                    {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
+                                  </span>
+                                </div>
+                                <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
+                                  {analysis ? "Analyzed" : "Metadata"}
+                                </span>
+                              </div>
+                              <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
+                            </div>
+                            {expanded && (
+                              <div className="trackDetail">
+                                {track.tags.length > 0 && (
+                                  <div className="trackDetailSection">
+                                    <strong>Tags</strong>
+                                    <p>{track.tags.join(" · ")}</p>
+                                  </div>
+                                )}
+                                {analysis ? (
+                                  <>
+                                    <div className="trackDetailSection">
+                                      <strong>Audio Features</strong>
+                                      <div className="analysisMetrics">
+                                        <span>{formatBpm(analysis.bpm)}</span>
+                                        <span>Energy {formatPercent(analysis.energy)}</span>
+                                        <span>Dance {formatPercent(analysis.danceability)}</span>
+                                        <span>Valence {formatPercent(analysis.valence)}</span>
+                                        <span>Acoustic {formatPercent(analysis.acousticness)}</span>
+                                        <span>Instrumental {formatPercent(analysis.instrumentalness)}</span>
+                                      </div>
+                                    </div>
+                                    {analysis.key && (
+                                      <div className="trackDetailSection">
+                                        <strong>Key</strong>
+                                        <p>{analysis.key}{analysis.camelotKey ? ` (${analysis.camelotKey})` : ""}{analysis.keyConfidence ? ` · confidence ${formatPercent(analysis.keyConfidence)}` : ""}</p>
+                                      </div>
+                                    )}
+                                    {analysis.moodTags?.length > 0 && (
+                                      <div className="trackDetailSection">
+                                        <strong>Mood Tags</strong>
+                                        <p>{analysis.moodTags.join(" · ")}</p>
+                                      </div>
+                                    )}
+                                  </>
+                                ) : (
+                                  <div className="trackDetailSection">
+                                    <strong>Audio Features</strong>
+                                    <p className="analysisFallback">Not available for this track yet.</p>
+                                  </div>
+                                )}
+                                {track.year && (
+                                  <div className="trackDetailSection">
+                                    <strong>Year</strong>
+                                    <p>{track.year}</p>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+              </>
             )}
           </div>
         </article>

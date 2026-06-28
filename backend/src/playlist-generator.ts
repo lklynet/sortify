@@ -576,7 +576,6 @@ type GenerateCandidatesConfig = {
   maxTracksPerPlaylist: number;
   generationKey: string;
   pinnedSlugs: Set<string>;
-  lockedSlugs: Set<string>;
   leastPlayedRows: Array<{
     id: number;
     tags_json: string;
@@ -593,7 +592,9 @@ type GenerateCandidatesConfig = {
 export async function generateCandidates(
   config: GenerateCandidatesConfig
 ): Promise<PlaylistCandidate[]> {
-  const { tracks: enriched, desiredWeeklyPlaylists, maxTracksPerPlaylist, generationKey, pinnedSlugs, lockedSlugs, leastPlayedRows, favoriteRows } = config;
+  const { tracks: enriched, desiredWeeklyPlaylists, maxTracksPerPlaylist, generationKey, pinnedSlugs, leastPlayedRows, favoriteRows } = config;
+
+  if (desiredWeeklyPlaylists <= 0) return [];
 
   const candidates: PlaylistCandidate[] = [];
   const artistByTrackId = new Map<number, string>();
@@ -1040,7 +1041,7 @@ export async function generateCandidates(
     });
   }
 
-  const limitedPlaylistCount = clamp(desiredWeeklyPlaylists, 1, 8) + pinnedSlugs.size;
+  const limitedPlaylistCount = clamp(desiredWeeklyPlaylists, 0, 8) + pinnedSlugs.size;
   const limitedTrackCount = clamp(maxTracksPerPlaylist, 5, 100);
   const minimumTrackCount = Math.min(limitedTrackCount, 12);
   return selectDiverseCandidates(
@@ -1050,7 +1051,6 @@ export async function generateCandidates(
         slug: candidate.slug || `weekly-${index + 1}`,
         trackIds: [...new Set(candidate.trackIds)].slice(0, playlistPoolTargetSize)
       }))
-      .filter((candidate) => !lockedSlugs.has(candidate.slug))
       .filter((candidate) => candidate.trackIds.length >= minimumTrackCount)
       .filter((candidate, index, list) => list.findIndex((entry) => entry.slug === candidate.slug) === index),
     limitedPlaylistCount,
