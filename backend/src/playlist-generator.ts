@@ -194,7 +194,6 @@ function formatTopTags(tags: string[], count: number): string {
 function buildPlaylistName(input: {
   source: PlaylistCandidate["source"];
   signatureTags: string[];
-  audioVector: number[];
   seedArtist?: string;
   moodName?: string;
 }): { name: string; description: string } {
@@ -498,7 +497,6 @@ function selectDiverseCandidates(
     const preferredPool = candidateProfiles.filter(
       (entry) => prioritizedSlugs.has(entry.candidate.slug) && !selected.includes(entry)
     );
-    const usedSources = new Set(selected.map((entry) => entry.candidate.source));
     const selectionPool = preferredPool.length ? preferredPool : candidateProfiles.filter((entry) => !selected.includes(entry));
     const next = selectionPool
       .map((entry) => {
@@ -514,10 +512,9 @@ function selectDiverseCandidates(
         });
         const maxSimilarity = Math.max(...similarities);
         const averageSimilarity = similarities.reduce((total, value) => total + value, 0) / similarities.length;
-        const sourceBonus = usedSources.has(entry.candidate.source) ? 0 : 0.08;
         return {
           entry,
-          score: entry.intrinsicScore + entry.selectionBias + sourceBonus - maxSimilarity * 0.85 - averageSimilarity * 0.3
+          score: entry.intrinsicScore + entry.selectionBias - maxSimilarity * 0.85 - averageSimilarity * 0.3
         };
       })
       .sort((a, b) => b.score - a.score)[0];
@@ -610,9 +607,12 @@ export async function generateCandidates(
       tagHistogram.set(stem, (tagHistogram.get(stem) ?? 0) + 1);
     }
   }
+  const random = seededRandom(hashSeed(`${generationKey}:candidates`));
   const topClusterTags = [...tagHistogram.entries()]
     .filter(([, count]) => count >= 4)
     .sort((a, b) => b[1] - a[1])
+    .slice(0, 24)
+    .sort(() => random() - 0.5)
     .slice(0, 16)
     .map(([tag]) => tag);
   for (const primaryTag of topClusterTags) {
@@ -652,8 +652,7 @@ export async function generateCandidates(
       .sort((a, b) => b.score - a.score)
       .slice(0, playlistPoolTargetSize * 3)
       .map((item) => item.id);
-    const pooled = limitTracksByArtist(
-      rerankTrackPoolForPlaylist(
+    const pooled = rerankTrackPoolForPlaylist(
         ranked,
         clamp(maxTracksPerPlaylist * 2, 24, playlistPoolTargetSize),
         centroid,
@@ -664,19 +663,13 @@ export async function generateCandidates(
         playCountByTrackId,
         favoriteByTrackId,
         maxPlayCount
-      ),
-      artistByTrackId,
-      maxArtistPerPlaylist,
-      clamp(maxTracksPerPlaylist * 2, 24, playlistPoolTargetSize),
-      maxArtistFallbackPerPlaylist
-    );
+      );
     if (pooled.length < 16) {
       continue;
     }
     const { name, description } = buildPlaylistName({
       source: "cluster",
-      signatureTags: centroid,
-      audioVector: seedAudioVector
+      signatureTags: centroid
     });
     candidates.push({
       name,
@@ -735,7 +728,6 @@ export async function generateCandidates(
     const { name, description } = buildPlaylistName({
       source: "mood",
       signatureTags,
-      audioVector: pooledAudioVector,
       moodName: mood.name
     });
     candidates.push({
@@ -773,7 +765,7 @@ export async function generateCandidates(
     const pooled = rerankTrackPoolForPlaylist(ranked, 48, centroid, contextAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
     const signatureTags = topTagsFromTrackIds(pooled, primaryTagsByTrackId, 5);
     const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
-    const { name, description } = buildPlaylistName({ source: "mood", signatureTags, audioVector: pooledAudioVector, moodName: contextual.name });
+    const { name, description } = buildPlaylistName({ source: "mood", signatureTags, moodName: contextual.name });
     candidates.push({ name, slug: contextual.slug, description, trackIds: pooled, source: "mood" as const, signatureTags, audioVector: pooledAudioVector });
   }
 
@@ -802,11 +794,11 @@ export async function generateCandidates(
       .sort((a, b) => b.score - a.score)
       .slice(0, bpmList.targetSize * 2)
       .map((item) => item.id);
-    const pooled = limitTracksByArtist(ranked, artistByTrackId, maxArtistPerPlaylist, bpmList.targetSize, maxArtistFallbackPerPlaylist);
+    const pooled = rerankTrackPoolForPlaylist(ranked, bpmList.targetSize, centroid, bpmAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
     if (pooled.length < 8) continue;
     const signatureTags = topTagsFromTrackIds(pooled, primaryTagsByTrackId, 4);
     const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
-    const { name, description } = buildPlaylistName({ source: "mood", signatureTags, audioVector: pooledAudioVector, moodName: bpmList.name });
+    const { name, description } = buildPlaylistName({ source: "mood", signatureTags, moodName: bpmList.name });
     candidates.push({ name, slug: bpmList.slug, description, trackIds: pooled, source: "mood" as const, signatureTags, audioVector: pooledAudioVector });
   }
 
@@ -836,65 +828,9 @@ export async function generateCandidates(
       const pooled = rerankTrackPoolForPlaylist(ranked, 42, centroid, decadeAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
       if (pooled.length < 10) continue;
       const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
-      const { name, description } = buildPlaylistName({ source: "cluster", signatureTags: centroid, audioVector: pooledAudioVector });
+      const { name, description } = buildPlaylistName({ source: "cluster", signatureTags: centroid });
       const decadeSlug = `decade-${decade}-${slugify(genre)}`;
       candidates.push({ name: `${titleCaseWords(genre)}: ${decade}`, slug: decadeSlug, description, trackIds: pooled, source: "cluster", signatureTags: centroid, audioVector: pooledAudioVector });
-    }
-  }
-
-  if (topClusterTags.length >= 2) {
-    const bridgePairs: Array<{ tagA: string; tagB: string }> = [];
-    const tagVectors = new Map<string, Map<string, number>>();
-    for (const tag of topClusterTags) {
-      const vec = new Map<string, number>();
-      const seedTracks = enriched.filter((track) => (primaryTagsByTrackId.get(track.id) ?? []).includes(tag));
-      for (const track of seedTracks) {
-        for (const coTag of primaryTagsByTrackId.get(track.id) ?? []) {
-          if (coTag === tag) continue;
-          vec.set(coTag, (vec.get(coTag) ?? 0) + 1);
-        }
-      }
-      tagVectors.set(tag, vec);
-    }
-    const dissimilarPairs = [];
-    for (let i = 0; i < topClusterTags.length; i++) {
-      for (let j = i + 1; j < topClusterTags.length; j++) {
-        const a = topClusterTags[i];
-        const b = topClusterTags[j];
-        const vecA = tagVectors.get(a);
-        const vecB = tagVectors.get(b);
-        if (!vecA || !vecB) continue;
-        let overlap = 0;
-        for (const tag of vecA.keys()) if (vecB.has(tag)) overlap++;
-        const similarity = overlap / Math.max(1, Math.min(vecA.size, vecB.size));
-        dissimilarPairs.push({ tagA: a, tagB: b, similarity });
-      }
-    }
-    dissimilarPairs.sort((a, b) => a.similarity - b.similarity);
-    for (const pair of dissimilarPairs.slice(0, 5)) {
-      const seedTracksA = enriched.filter((track) => (primaryTagsByTrackId.get(track.id) ?? []).includes(pair.tagA));
-      const seedTracksB = enriched.filter((track) => (primaryTagsByTrackId.get(track.id) ?? []).includes(pair.tagB));
-      const seedIds = [...new Set([...seedTracksA.map((t) => t.id), ...seedTracksB.map((t) => t.id)])];
-      if (seedIds.length < 12) continue;
-      const centroid = uniqueTags([pair.tagA, pair.tagB]);
-      const bridgeAudioVector = averageAudioVector(seedIds, audioVectorByTrackId);
-      const ranked = [...enriched]
-        .map((track) => ({
-          id: track.id,
-          score:
-            cosineScore(primaryTagsByTrackId.get(track.id) ?? track.tags, centroid) * 0.64 +
-            cosineNumberScore(audioVectorByTrackId.get(track.id) ?? [], bridgeAudioVector) * 0.22 +
-            ((primaryTagsByTrackId.get(track.id) ?? []).includes(pair.tagA) || (primaryTagsByTrackId.get(track.id) ?? []).includes(pair.tagB) ? 0.14 : 0)
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, playlistPoolTargetSize * 2)
-        .map((item) => item.id);
-      const pooled = rerankTrackPoolForPlaylist(ranked, 44, centroid, bridgeAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
-      if (pooled.length < 14) continue;
-      const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
-      const bridgeName = `${titleCaseWords(pair.tagA)} × ${titleCaseWords(pair.tagB)}`;
-      const bridgeSlug = `bridge-${slugify(pair.tagA)}-${slugify(pair.tagB)}`;
-      candidates.push({ name: bridgeName, slug: bridgeSlug, description: `Where ${titleCaseWords(pair.tagA)} meets ${titleCaseWords(pair.tagB)}`, trackIds: pooled, source: "cluster", signatureTags: centroid, audioVector: pooledAudioVector });
     }
   }
 
@@ -912,6 +848,8 @@ export async function generateCandidates(
   const artistSeeds = [...artists.entries()]
     .filter(([, entry]) => entry.ids.length >= 3)
     .sort((a, b) => b[1].ids.length - a[1].ids.length)
+    .slice(0, 8)
+    .sort(() => random() - 0.5)
     .slice(0, 4);
   for (const [seedArtist, seedData] of artistSeeds) {
     const seedTags = uniqueTags(seedData.tags.filter((tag) => isPrimaryClusterTag(tag)));
@@ -942,7 +880,6 @@ export async function generateCandidates(
     const { name, description } = buildPlaylistName({
       source: "artist",
       signatureTags: seedTags,
-      audioVector,
       seedArtist
     });
     candidates.push({
@@ -1005,8 +942,7 @@ export async function generateCandidates(
     const discoveryTags = favoriteTags.slice(0, 8);
     const { name, description } = buildPlaylistName({
       source: "discovery",
-      signatureTags: discoveryTags,
-      audioVector
+      signatureTags: discoveryTags
     });
     candidates.push({
       name,

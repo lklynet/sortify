@@ -1395,7 +1395,7 @@ async function runWorkerCycle(trigger: "start" | "weekly"): Promise<void> {
       meta: { trigger, weeklyPlaylistCount: workerState.weeklyPlaylistCount }
     });
     await scanLibrary(workerConnection);
-    await refreshRecommendedPlaylists(workerState.weeklyPlaylistCount);
+    await refreshRecommendedPlaylists(workerState.weeklyPlaylistCount, randomUUID());
     await syncSubsonicPlaylists(workerConnection);
     workerState.lastRunAt = new Date().toISOString();
     workerState.lastRunWeek = isoWeekKey();

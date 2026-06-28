@@ -6,6 +6,8 @@
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .app-header {
@@ -469,6 +471,8 @@ button:disabled {
   display: grid;
   gap: 1.1rem;
   grid-template-columns: minmax(280px, 0.95fr) minmax(560px, 2.05fr);
+  flex: 1;
+  min-height: 0;
 }
 
 .toast {
@@ -522,6 +526,18 @@ button:disabled {
   line-height: 1.45;
 }
 
+.content-grid .panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.content-grid .panel-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .trackList,
 .playlistList {
   list-style: none;
@@ -529,8 +545,6 @@ button:disabled {
   margin: 0;
   display: flex;
   flex-direction: column;
-  max-height: 460px;
-  overflow-y: auto;
 }
 
 ::-webkit-scrollbar {
@@ -911,13 +925,6 @@ button:disabled {
   padding: 0.2rem 0.5rem;
   font-size: 0.68rem;
   line-height: 1.25;
-  color: var(--text-muted);
-}
-
-.snapshotMeta {
-  display: block;
-  margin-top: 0.25rem;
-  font-size: 0.72rem;
   color: var(--text-muted);
 }
 

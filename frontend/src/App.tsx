@@ -39,16 +39,6 @@ type Playlist = {
   artworkAttributionUrl: string | null;
   tracks: Array<{ id: number; title: string; artist: string; album: string; path: string }>;
 };
-type Snapshot = {
-  id: number;
-  playlistId: number;
-  slug: string;
-  name: string;
-  trackIds: number[];
-  trackCount: number;
-  snapshotWeek: string;
-  createdAt: string;
-};
 type LibraryStats = {
   trackCount: number;
   analyzedCount: number;
@@ -166,9 +156,8 @@ function App() {
   const [logs, setLogs] = useState<OperationLog[]>([]);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
-  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
-  const [playlistTab, setPlaylistTab] = useState<"playlists" | "history" | "stats" | "filter">("playlists");
+  const [playlistTab, setPlaylistTab] = useState<"playlists" | "stats" | "filter">("playlists");
   const [worker, setWorker] = useState<WorkerState | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -322,18 +311,16 @@ function App() {
   }, [settingsDraft.navidromePassword, settingsDraft.navidromeUrl, settingsDraft.navidromeUsername]);
 
   const loadDashboardData = useCallback(async () => {
-    const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedSnapshots, fetchedLibraryStats, fetchedWorker, fetchedSettings] = await Promise.all([
+    const [fetchedStats, fetchedTracks, fetchedPlaylists, fetchedLibraryStats, fetchedWorker, fetchedSettings] = await Promise.all([
       callApi<Stats>("/api/stats"),
       callApi<Track[]>("/api/tracks?limit=20"),
       callApi<Playlist[]>("/api/playlists"),
-      callApi<Snapshot[]>("/api/playlists/snapshots"),
       callApi<LibraryStats>("/api/stats/library"),
       callApi<WorkerState>("/api/worker"),
       callApi<Settings>("/api/settings")
     ]);
     setStats(fetchedStats);
     setTracks(fetchedTracks);
-    setSnapshots(fetchedSnapshots);
     setLibraryStats(fetchedLibraryStats);
     setPlaylists((currentPlaylists) => {
       if (playlistReorderOnNextLoadRef.current || !currentPlaylists.length) {
@@ -876,12 +863,6 @@ function App() {
                 Playlists
               </button>
               <button
-                className={`tab ${playlistTab === "history" ? "active" : ""}`}
-                onClick={() => setPlaylistTab("history")}
-              >
-                History
-              </button>
-              <button
                 className={`tab ${playlistTab === "stats" ? "active" : ""}`}
                 onClick={() => setPlaylistTab("stats")}
               >
@@ -997,32 +978,6 @@ function App() {
                 </li>
               ))}
             </ul>
-            ) : playlistTab === "history" ? (
-            snapshots.length === 0 ? (
-              <p className="emptyState">No history yet. Old playlists will appear here after the next weekly refresh.</p>
-            ) : (
-            <ul className="playlistList">
-              {snapshots.map((s) => (
-                <li key={s.id}>
-                  <div className="playlistCard">
-                    <div className="playlistArtwork playlistArtworkFallback" aria-hidden="true">
-                      {s.name.slice(0, 1).toUpperCase()}
-                    </div>
-                    <div className="playlistBody">
-                      <div className="playlistTopRow">
-                        <div className="playlistHead">
-                          <strong>{s.name}</strong>
-                          <span className="snapshotMeta">
-                            Week {s.snapshotWeek} · {s.trackCount} tracks · {new Date(s.createdAt).toLocaleDateString()}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </li>
-              ))}
-            </ul>
-            )
             ) : playlistTab === "stats" ? (
               libraryStats ? (
                 <div className="statsPanel">
