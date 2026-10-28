@@ -429,15 +429,20 @@ function rerankTrackPoolForPlaylist(
         const favoriteBonus = favoriteByTrackId.get(trackId) ? 0.06 : 0;
         const sourceRank = sourceRankByTrackId.get(trackId) ?? uniqueTrackIds.length - 1;
         const sourceScore = uniqueTrackIds.length > 1 ? 1 - sourceRank / (uniqueTrackIds.length - 1) : 1;
-        const redundancyPenalty = selected.length
-          ? Math.max(
-              ...selected.map((selectedTrackId) => {
-                const selectedTags = trackTagsByTrackId.get(selectedTrackId) ?? [];
-                const selectedAudio = audioVectorByTrackId.get(selectedTrackId) ?? [];
-                return cosineScore(tags, selectedTags) * 0.72 + cosineNumberScore(audioVector, selectedAudio) * 0.28;
-              })
-            )
-          : 0;
+        // Loop instead of Math.max(...selected.map(...)): same result without
+        // growing a function-call argument list.
+        let redundancyPenalty = Number.NEGATIVE_INFINITY;
+        for (const selectedTrackId of selected) {
+          const selectedTags = trackTagsByTrackId.get(selectedTrackId) ?? [];
+          const selectedAudio = audioVectorByTrackId.get(selectedTrackId) ?? [];
+          const similarity = cosineScore(tags, selectedTags) * 0.72 + cosineNumberScore(audioVector, selectedAudio) * 0.28;
+          if (similarity > redundancyPenalty) {
+            redundancyPenalty = similarity;
+          }
+        }
+        if (!selected.length) {
+          redundancyPenalty = 0;
+        }
         const score = tagScore * 0.46 + audioScore * 0.24 + noveltyScore * 0.16 + sourceScore * 0.14 + favoriteBonus - redundancyPenalty * 0.18;
         if (score > bestScore) {
           bestScore = score;
@@ -503,15 +508,22 @@ function selectDiverseCandidates(
         if (!selected.length) {
           return { entry, score: entry.intrinsicScore + entry.selectionBias };
         }
-        const similarities = selected.map((picked) => {
+        // Loop instead of building an array + Math.max(...similarities):
+        // same operations, same order, no argument-list spread.
+        let maxSimilarity = Number.NEGATIVE_INFINITY;
+        let similarityTotal = 0;
+        for (const picked of selected) {
           const trackOverlap = jaccardScore(entry.candidate.trackIds, picked.candidate.trackIds);
           const artistOverlap = jaccardScore(entry.artistSet, picked.artistSet);
           const tagSimilarity = cosineScore(entry.signatureTags, picked.signatureTags);
           const audioSimilarity = cosineNumberScore(entry.audioVector, picked.audioVector);
-          return trackOverlap * 0.35 + artistOverlap * 0.25 + tagSimilarity * 0.25 + audioSimilarity * 0.15;
-        });
-        const maxSimilarity = Math.max(...similarities);
-        const averageSimilarity = similarities.reduce((total, value) => total + value, 0) / similarities.length;
+          const similarity = trackOverlap * 0.35 + artistOverlap * 0.25 + tagSimilarity * 0.25 + audioSimilarity * 0.15;
+          if (similarity > maxSimilarity) {
+            maxSimilarity = similarity;
+          }
+          similarityTotal += similarity;
+        }
+        const averageSimilarity = similarityTotal / selected.length;
         return {
           entry,
           score: entry.intrinsicScore + entry.selectionBias - maxSimilarity * 0.85 - averageSimilarity * 0.3
@@ -578,7 +590,17 @@ export async function generateCandidates(
   const audioVectorByTrackId = new Map<number, number[]>();
   const playCountByTrackId = new Map<number, number>();
   const favoriteByTrackId = new Map<number, boolean>();
-  const maxPlayCount = Math.max(...enriched.map((track) => Math.max(0, track.play_count ?? 0)), 0);
+  // NOTE: compute with a loop, not Math.max(...enriched.map(...)). Spreading the
+  // full track list into a call's argument list throws "RangeError: Maximum
+  // call stack size exceeded" once the library exceeds the engine's argument
+  // limit (~65k tracks on Node 22).
+  let maxPlayCount = 0;
+  for (const track of enriched) {
+    const playCount = Math.max(0, track.play_count ?? 0);
+    if (playCount > maxPlayCount) {
+      maxPlayCount = playCount;
+    }
+  }
 
   for (const track of enriched) {
     artistByTrackId.set(track.id, track.artist ? normalizeTag(track.artist) : `track-${track.id}`);
