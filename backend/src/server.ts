@@ -15,6 +15,7 @@ import { fetchLastFmTags } from "./lastfm.js";
 import { fetchMusicBrainzTags } from "./musicbrainz.js";
 import { bootstrap as bootstrapScheduler, enqueueScan, claimScheduledCycles, tryLockCycle, schedulerTick, schedulePresets, defaultSchedulePreset, rescheduleCycle } from "./scheduler.js";
 import { createLogger } from "./logger.js";
+import { buildTrackFilterWhere, syncablePathClause } from "./track-filter.js";
 
 type TrackRecord = {
   id: number;
@@ -1275,50 +1276,12 @@ async function refreshRecommendedPlaylists(
   for (const fp of filterPlaylists) {
     let filters: Record<string, unknown> = {};
     try { filters = JSON.parse(fp.filter_json) as Record<string, unknown>; } catch { continue; }
-    const filterPool = enrichedTracks.filter((track) => {
-      if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
-        const needles = (filters.selectedTags as string[]).map((t) => String(t).toLowerCase());
-        if (!needles.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
-      }
-      if (typeof filters.bpmMin === "number" && !Number.isNaN(filters.bpmMin as number)) {
-        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-        if ((af?.bpm ?? 0) < (filters.bpmMin as number)) return false;
-      }
-      if (typeof filters.bpmMax === "number" && !Number.isNaN(filters.bpmMax as number)) {
-        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-        if ((af?.bpm ?? 0) > (filters.bpmMax as number)) return false;
-      }
-      if (typeof filters.keyQuery === "string" && filters.keyQuery) {
-        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-        const qk = (filters.keyQuery as string).toLowerCase();
-        if (!(af?.key ?? "").toLowerCase().includes(qk) && !(af?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
-      }
-      if (typeof filters.energyMin === "number" && !Number.isNaN(filters.energyMin as number)) {
-        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-        if ((af?.energy ?? 0) * 100 < (filters.energyMin as number)) return false;
-      }
-      if (typeof filters.energyMax === "number" && !Number.isNaN(filters.energyMax as number)) {
-        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-        if ((af?.energy ?? 0) * 100 > (filters.energyMax as number)) return false;
-      }
-      if (typeof filters.yearMin === "number" && !Number.isNaN(filters.yearMin as number)) {
-        if ((track.year ?? 0) < (filters.yearMin as number)) return false;
-      }
-      if (typeof filters.yearMax === "number" && !Number.isNaN(filters.yearMax as number)) {
-        if ((track.year ?? 0) > (filters.yearMax as number)) return false;
-      }
-      if (typeof filters.keyMode === "string" && filters.keyMode) {
-        const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-        const key = (af?.key ?? "").toLowerCase();
-        const isMinor = key.includes("m") && !key.includes("major");
-        const isMajor = key && !isMinor;
-        if (filters.keyMode === "minor" && !isMinor) return false;
-        if (filters.keyMode === "major" && !isMajor) return false;
-      }
-      return true;
-    });
-    if (filterPool.length < 5) continue;
-    const trackIds = filterPool.slice(0, settings.maxTracksPerPlaylist).map((t) => t.id);
+    const { where, params } = buildTrackFilterWhere(filters);
+    const rows = db
+      .prepare(`SELECT id FROM tracks WHERE ${where} AND ${syncablePathClause()} ORDER BY id LIMIT ?`)
+      .all(...params, settings.maxTracksPerPlaylist) as Array<{ id: number }>;
+    if (rows.length < 5) continue;
+    const trackIds = rows.map((row) => row.id);
     const description = buildFilterDescription(filters);
     refreshProtectedPlaylistDescriptionStmt.run({ id: fp.id, description, updated_at: new Date().toISOString() });
     candidates.push({
@@ -1712,6 +1675,101 @@ app.get("/api/tracks/search", (req, res) => {
       audioFeatures: audioFeaturesFromTrack(row),
       audioVector: audioVectorFromTrack(row)
     }))
+  );
+});
+
+function queryNumberParam(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim() === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+app.get("/api/tracks/filter", (req, res) => {
+  const filters: Record<string, unknown> = {
+    // The frontend sends tags as a single comma-joined value (see buildFilterUrl);
+    // split each value so "tags=jazz,folk" behaves like "tags=jazz&tags=folk".
+    selectedTags: (Array.isArray(req.query.tags)
+      ? (req.query.tags as unknown[])
+      : typeof req.query.tags === "string" && req.query.tags.trim()
+        ? [req.query.tags]
+        : []
+    ).flatMap((tag) => String(tag).split(",")),
+    bpmMin: queryNumberParam(req.query.bpmMin),
+    bpmMax: queryNumberParam(req.query.bpmMax),
+    keyQuery: typeof req.query.keyQuery === "string" ? req.query.keyQuery : "",
+    keyMode: req.query.keyMode === "major" || req.query.keyMode === "minor" ? req.query.keyMode : "",
+    energyMin: queryNumberParam(req.query.energyMin),
+    energyMax: queryNumberParam(req.query.energyMax),
+    yearMin: queryNumberParam(req.query.yearMin),
+    yearMax: queryNumberParam(req.query.yearMax)
+  };
+  const { where, params } = buildTrackFilterWhere(filters);
+  const limit = Math.max(1, Math.min(Math.floor(Number(req.query.limit ?? 100)) || 100, 500));
+  const offset = Math.max(0, Math.floor(Number(req.query.offset ?? 0)) || 0);
+  const totalRow = db.prepare(`SELECT COUNT(*) AS count FROM tracks WHERE ${where}`).get(...params) as { count: number };
+  const rows = db
+    .prepare(
+      `SELECT id, title, artist, album, year, tags_json, audio_features_json
+       FROM tracks
+       WHERE ${where}
+       ORDER BY last_scanned_at DESC, id DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...params, limit, offset) as Array<{
+      id: number;
+      title: string | null;
+      artist: string | null;
+      album: string | null;
+      year: number | null;
+      tags_json: string;
+      audio_features_json: string;
+    }>;
+  res.json({
+    total: totalRow.count,
+    tracks: rows.map((row) => ({
+      id: row.id,
+      title: row.title ?? "",
+      artist: row.artist ?? "",
+      album: row.album ?? "",
+      year: row.year,
+      tags: tagsFromTrack(row),
+      audioFeatures: audioFeaturesFromTrack(row)
+    }))
+  });
+});
+
+let sortedTagCountsCache: { sorted: Array<[string, number]>; at: number } | null = null;
+const sortedTagCountsCacheMs = 60_000;
+
+function getSortedTagCounts(): Array<[string, number]> {
+  const now = Date.now();
+  if (sortedTagCountsCache && now - sortedTagCountsCache.at < sortedTagCountsCacheMs) {
+    return sortedTagCountsCache.sorted;
+  }
+  const rows = db.prepare("SELECT tags_json FROM tracks").all() as Array<{ tags_json: string }>;
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    for (const tag of tagsFromTrack(row)) {
+      counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    }
+  }
+  sortedTagCountsCache = {
+    sorted: [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+    at: now
+  };
+  return sortedTagCountsCache.sorted;
+}
+
+app.get("/api/tracks/tag-suggestions", (req, res) => {
+  const q = (typeof req.query.q === "string" ? req.query.q : "").trim().toLowerCase();
+  const limit = Math.max(1, Math.min(Math.floor(Number(req.query.limit ?? 30)) || 30, 100));
+  res.json(
+    getSortedTagCounts()
+      .filter(([tag]) => !q || tag.toLowerCase().includes(q))
+      .slice(0, limit)
+      .map(([tag, count]) => ({ tag, count }))
   );
 });
 
@@ -2240,63 +2298,11 @@ app.post("/api/playlists/filter", async (req, res) => {
   const slug = `filter-${sanitizeSlug(name)}-${Date.now().toString(36)}`;
   const description = buildFilterDescription(filters);
   let playlistId = 0;
-  const tracks = db
-    .prepare("SELECT id, path, title, artist, album, year, duration, tags_json, audio_features_json, audio_vector_json, analysis_version, analysis_updated_at, play_count, favorite FROM tracks")
-    .all() as TrackRecord[];
-  const syncableTracks = tracks.filter((track) => Boolean(extractSubsonicSongId(track.path)));
-  const enriched = syncableTracks.map((track) => ({
-    id: track.id,
-    title: track.title,
-    artist: track.artist,
-    album: track.album,
-    year: track.year,
-    tags_json: track.tags_json,
-    audio_features_json: track.audio_features_json,
-    tags: tagsFromTrack(track)
-  }));
-  const filterPool = enriched.filter((track) => {
-    if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
-      const needles = (filters.selectedTags as string[]).map((t) => String(t).toLowerCase());
-      if (!needles.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
-    }
-    if (typeof filters.bpmMin === "number" && !Number.isNaN(filters.bpmMin as number)) {
-      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-      if ((af?.bpm ?? 0) < (filters.bpmMin as number)) return false;
-    }
-    if (typeof filters.bpmMax === "number" && !Number.isNaN(filters.bpmMax as number)) {
-      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-      if ((af?.bpm ?? 0) > (filters.bpmMax as number)) return false;
-    }
-    if (typeof filters.keyQuery === "string" && filters.keyQuery) {
-      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-      const qk = (filters.keyQuery as string).toLowerCase();
-      if (!(af?.key ?? "").toLowerCase().includes(qk) && !(af?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
-    }
-    if (typeof filters.keyMode === "string" && filters.keyMode) {
-      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-      const key = (af?.key ?? "").toLowerCase();
-      const isMinor = key.includes("m") && !key.includes("major");
-      const isMajor = key && !isMinor;
-      if (filters.keyMode === "minor" && !isMinor) return false;
-      if (filters.keyMode === "major" && !isMajor) return false;
-    }
-    if (typeof filters.energyMin === "number" && !Number.isNaN(filters.energyMin as number)) {
-      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-      if ((af?.energy ?? 0) * 100 < (filters.energyMin as number)) return false;
-    }
-    if (typeof filters.energyMax === "number" && !Number.isNaN(filters.energyMax as number)) {
-      const af = audioFeaturesFromTrack({ audio_features_json: track.audio_features_json } as TrackRecord);
-      if ((af?.energy ?? 0) * 100 > (filters.energyMax as number)) return false;
-    }
-    if (typeof filters.yearMin === "number" && !Number.isNaN(filters.yearMin as number)) {
-      if ((track.year ?? 0) < (filters.yearMin as number)) return false;
-    }
-    if (typeof filters.yearMax === "number" && !Number.isNaN(filters.yearMax as number)) {
-      if ((track.year ?? 0) > (filters.yearMax as number)) return false;
-    }
-    return true;
-  });
-  const cappedTrackIds = filterPool.slice(0, settings.maxTracksPerPlaylist).map((t) => t.id);
+  const { where, params } = buildTrackFilterWhere(filters);
+  const cappedRows = db
+    .prepare(`SELECT id FROM tracks WHERE ${where} AND ${syncablePathClause()} ORDER BY id LIMIT ?`)
+    .all(...params, settings.maxTracksPerPlaylist) as Array<{ id: number }>;
+  const cappedTrackIds = cappedRows.map((row) => row.id);
   const artworkPath = await renderFilterPlaylistArtwork(slug, name, cappedTrackIds);
   db.transaction(() => {
     const result = insertPlaylistStmt.run({

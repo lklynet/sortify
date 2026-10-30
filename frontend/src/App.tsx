@@ -58,8 +58,23 @@ type Track = {
   year: number | null;
   tags: string[];
   audioFeatures: AudioFeatures | null;
-  audioVector: number[];
+  audioVector?: number[];
   analysis_updated_at?: string | null;
+};
+type FilterParams = {
+  selectedTags: string[];
+  bpmMin: number;
+  bpmMax: number;
+  keyQuery: string;
+  keyMode: "" | "major" | "minor";
+  energyMin: number;
+  energyMax: number;
+  yearMin: number;
+  yearMax: number;
+};
+type FilterResult = {
+  total: number;
+  tracks: Track[];
 };
 type WorkerState = {
   running: boolean;
@@ -93,6 +108,29 @@ type ConfirmRefreshModal =
 
 const apiBase = import.meta.env.VITE_API_BASE ?? "";
 
+const FILTER_PAGE_SIZE = 100;
+const FILTER_LOAD_MORE_SIZE = 200;
+const FILTER_MAX_ROWS = 2000;
+const FILTER_DEBOUNCE_MS = 250;
+
+function buildFilterUrl(params: FilterParams, offset: number, limit: number) {
+  const query = new URLSearchParams();
+  if (params.selectedTags.length > 0) {
+    query.set("tags", params.selectedTags.join(","));
+  }
+  if (!Number.isNaN(params.bpmMin)) query.set("bpmMin", String(params.bpmMin));
+  if (!Number.isNaN(params.bpmMax)) query.set("bpmMax", String(params.bpmMax));
+  if (params.keyQuery.trim()) query.set("keyQuery", params.keyQuery);
+  if (params.keyMode) query.set("keyMode", params.keyMode);
+  if (!Number.isNaN(params.energyMin)) query.set("energyMin", String(params.energyMin));
+  if (!Number.isNaN(params.energyMax)) query.set("energyMax", String(params.energyMax));
+  if (!Number.isNaN(params.yearMin)) query.set("yearMin", String(params.yearMin));
+  if (!Number.isNaN(params.yearMax)) query.set("yearMax", String(params.yearMax));
+  query.set("offset", String(offset));
+  query.set("limit", String(limit));
+  return `/api/tracks/filter?${query.toString()}`;
+}
+
 async function callApi<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBase}${url}`, {
     ...init,
@@ -125,6 +163,82 @@ function formatBpm(value: number | null) {
 
 function hasAudioAnalysis(track: Track) {
   return Boolean(track.audioFeatures && Array.isArray(track.audioFeatures.moodTags));
+}
+
+function TrackRow({ track, expanded, onToggle }: { track: Track; expanded: boolean; onToggle: () => void }) {
+  const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
+  return (
+    <li>
+      <div
+        className={`trackRow ${expanded ? "trackRowExpanded" : ""}`}
+        onClick={onToggle}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle(); } }}
+      >
+        <div className="trackHead">
+          <div>
+            <strong>{track.title || "Unknown Title"}</strong>
+            <span>
+              {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
+            </span>
+          </div>
+          <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
+            {analysis ? "Analyzed" : "Metadata"}
+          </span>
+        </div>
+        <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
+      </div>
+      {expanded && (
+        <div className="trackDetail">
+          {track.tags.length > 0 && (
+            <div className="trackDetailSection">
+              <strong>Tags</strong>
+              <p>{track.tags.join(" · ")}</p>
+            </div>
+          )}
+          {analysis ? (
+            <>
+              <div className="trackDetailSection">
+                <strong>Audio Features</strong>
+                <div className="analysisMetrics">
+                  <span>{formatBpm(analysis.bpm)}</span>
+                  <span>Energy {formatPercent(analysis.energy)}</span>
+                  <span>Dance {formatPercent(analysis.danceability)}</span>
+                  <span>Valence {formatPercent(analysis.valence)}</span>
+                  <span>Acoustic {formatPercent(analysis.acousticness)}</span>
+                  <span>Instrumental {formatPercent(analysis.instrumentalness)}</span>
+                </div>
+              </div>
+              {analysis.key && (
+                <div className="trackDetailSection">
+                  <strong>Key</strong>
+                  <p>{analysis.key}{analysis.camelotKey ? ` (${analysis.camelotKey})` : ""}{analysis.keyConfidence ? ` · confidence ${formatPercent(analysis.keyConfidence)}` : ""}</p>
+                </div>
+              )}
+              {analysis.moodTags?.length > 0 && (
+                <div className="trackDetailSection">
+                  <strong>Mood Tags</strong>
+                  <p>{analysis.moodTags.join(" · ")}</p>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="trackDetailSection">
+              <strong>Audio Features</strong>
+              <p className="analysisFallback">Not available for this track yet.</p>
+            </div>
+          )}
+          {track.year && (
+            <div className="trackDetailSection">
+              <strong>Year</strong>
+              <p>{track.year}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </li>
+  );
 }
 
 function App() {
@@ -168,9 +282,14 @@ function App() {
   const [searchResults, setSearchResults] = useState<Track[] | null>(null);
   const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [allTracks, setAllTracks] = useState<Track[]>([]);
-  const [allTracksLoaded, setAllTracksLoaded] = useState(false);
-  const [filterParams, setFilterParams] = useState({ selectedTags: [] as string[], bpmMin: NaN, bpmMax: NaN, keyQuery: "", keyMode: "" as "" | "major" | "minor", energyMin: NaN, energyMax: NaN, yearMin: NaN, yearMax: NaN });
+  const [filterParams, setFilterParams] = useState<FilterParams>({ selectedTags: [], bpmMin: NaN, bpmMax: NaN, keyQuery: "", keyMode: "", energyMin: NaN, energyMax: NaN, yearMin: NaN, yearMax: NaN });
+  const [filterTracks, setFilterTracks] = useState<Track[]>([]);
+  const [filterTotal, setFilterTotal] = useState<number | null>(null);
+  const [filterLoading, setFilterLoading] = useState(false);
+  const [filterMoreLoading, setFilterMoreLoading] = useState(false);
+  const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
+  const filterRequestRef = useRef(0);
+  const tagSuggestionRequestRef = useRef(0);
   const [tagInputText, setTagInputText] = useState("");
   const [tagInputFocused, setTagInputFocused] = useState(false);
   const [savingFilterPlaylist, setSavingFilterPlaylist] = useState(false);
@@ -196,26 +315,61 @@ function App() {
   const seenToastIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    if (playlistTab === "filter" && !allTracksLoaded) {
-      callApi<Track[]>("/api/tracks/all")
-        .then((t) => { setAllTracks(t); setAllTracksLoaded(true); })
-        .catch(() => null);
-    }
-  }, [playlistTab, allTracksLoaded]);
+    const requestKey = ++filterRequestRef.current;
+    setFilterLoading(true);
+    const timer = setTimeout(() => {
+      callApi<FilterResult>(buildFilterUrl(filterParams, 0, FILTER_PAGE_SIZE))
+        .then((result) => {
+          if (filterRequestRef.current !== requestKey) return;
+          setFilterTracks(result.tracks);
+          setFilterTotal(result.total);
+        })
+        .catch(() => {
+          if (filterRequestRef.current !== requestKey) return;
+          setFilterTracks([]);
+          setFilterTotal(0);
+        })
+        .finally(() => {
+          if (filterRequestRef.current !== requestKey) return;
+          setFilterLoading(false);
+        });
+    }, FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [filterParams]);
 
-  const tagSuggestions = (() => {
-    const sourceTracks = filterParams.selectedTags.length > 0
-      ? allTracks.filter((t) => filterParams.selectedTags.every((needle) => t.tags.some((tag) => tag.toLowerCase().includes(needle))))
-      : allTracks;
-    const set = new Set<string>();
-    for (const t of sourceTracks) {
-      for (const tag of t.tags) set.add(tag);
-    }
-    const pool = [...set].sort((a, b) => a.localeCompare(b)).filter((t) => !filterParams.selectedTags.includes(t));
-    if (!tagInputText.trim()) return pool.slice(0, 20);
-    const q = tagInputText.toLowerCase();
-    return pool.filter((tag) => tag.toLowerCase().includes(q)).slice(0, 20);
-  })();
+  useEffect(() => {
+    const requestKey = ++tagSuggestionRequestRef.current;
+    const timer = setTimeout(() => {
+      const q = tagInputText.trim().toLowerCase();
+      callApi<Array<{ tag: string }>>(`/api/tracks/tag-suggestions?q=${encodeURIComponent(q)}&limit=50`)
+        .then((items) => {
+          if (tagSuggestionRequestRef.current !== requestKey) return;
+          const selected = new Set(filterParams.selectedTags);
+          setTagSuggestions(items.map((item) => item.tag).filter((tag) => !selected.has(tag)).slice(0, 20));
+        })
+        .catch(() => null);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [tagInputText, filterParams.selectedTags]);
+
+  const loadMoreFilterTracks = () => {
+    if (filterLoading || filterMoreLoading) return;
+    if (filterTotal !== null && filterTracks.length >= filterTotal) return;
+    if (filterTracks.length >= FILTER_MAX_ROWS) return;
+    const offset = filterTracks.length;
+    const requestKey = ++filterRequestRef.current;
+    setFilterMoreLoading(true);
+    callApi<FilterResult>(buildFilterUrl(filterParams, offset, FILTER_LOAD_MORE_SIZE))
+      .then((result) => {
+        if (filterRequestRef.current !== requestKey) return;
+        setFilterTracks((current) => [...current, ...result.tracks]);
+      })
+      .catch(() => null)
+      .finally(() => {
+        if (filterRequestRef.current !== requestKey) return;
+        setFilterMoreLoading(false);
+      });
+  };
 
   const addTag = (tag: string) => {
     const clean = tag.trim().toLowerCase();
@@ -231,35 +385,6 @@ function App() {
     setFilterParams((p) => ({ ...p, selectedTags: p.selectedTags.filter((t) => t !== tag) }));
   };
 
-  const filteredTracks = (() => {
-    if (allTracks.length === 0) return allTracks;
-    const p = filterParams;
-    const hasFilters = p.selectedTags.length > 0 || !Number.isNaN(p.bpmMin) || !Number.isNaN(p.bpmMax) || p.keyQuery || p.keyMode || !Number.isNaN(p.energyMin) || !Number.isNaN(p.energyMax) || !Number.isNaN(p.yearMin) || !Number.isNaN(p.yearMax);
-    if (!hasFilters) return allTracks;
-    return allTracks.filter((track) => {
-      if (p.selectedTags.length > 0) {
-        if (!p.selectedTags.every((needle) => track.tags.some((tag) => tag.toLowerCase().includes(needle)))) return false;
-      }
-      if (!Number.isNaN(p.bpmMin) && (track.audioFeatures?.bpm ?? 0) < p.bpmMin) return false;
-      if (!Number.isNaN(p.bpmMax) && (track.audioFeatures?.bpm ?? 0) > p.bpmMax) return false;
-      if (p.keyQuery) {
-        const qk = p.keyQuery.toLowerCase();
-        if (!(track.audioFeatures?.key ?? "").toLowerCase().includes(qk) && !(track.audioFeatures?.camelotKey ?? "").toLowerCase().includes(qk)) return false;
-      }
-      if (p.keyMode) {
-        const key = (track.audioFeatures?.key ?? "").toLowerCase();
-        const isKeyMinor = key.includes("m") && !key.includes("major");
-        const isKeyMajor = key && !isKeyMinor;
-        if (p.keyMode === "minor" && !isKeyMinor) return false;
-        if (p.keyMode === "major" && !isKeyMajor) return false;
-      }
-      if (!Number.isNaN(p.energyMin) && (track.audioFeatures?.energy ?? 0) * 100 < p.energyMin) return false;
-      if (!Number.isNaN(p.energyMax) && (track.audioFeatures?.energy ?? 0) * 100 > p.energyMax) return false;
-      if (!Number.isNaN(p.yearMin) && (track.year ?? 0) < p.yearMin) return false;
-      if (!Number.isNaN(p.yearMax) && (track.year ?? 0) > p.yearMax) return false;
-      return true;
-    });
-  })();
   const hasLoadedLogsRef = useRef(false);
 
   const hasNavidromePassword = Boolean(settingsDraft.navidromePassword.trim() || settingsDraft.hasNavidromePassword);
@@ -771,82 +896,14 @@ function App() {
               }
               return (
                 <ul className="trackList">
-                  {displayTracks.map((track) => {
-                    const expanded = expandedTrackId === track.id;
-                    const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
-                    return (
-                      <li key={track.id}>
-                        <div
-                          className={`trackRow ${expanded ? "trackRowExpanded" : ""}`}
-                          onClick={() => setExpandedTrackId(expanded ? null : track.id)}
-                          role="button"
-                          tabIndex={0}
-                          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpandedTrackId(expanded ? null : track.id); } }}
-                        >
-                          <div className="trackHead">
-                            <div>
-                              <strong>{track.title || "Unknown Title"}</strong>
-                              <span>
-                                {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
-                              </span>
-                            </div>
-                            <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
-                              {analysis ? "Analyzed" : "Metadata"}
-                            </span>
-                          </div>
-                          <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
-                        </div>
-                        {expanded && (
-                          <div className="trackDetail">
-                            {track.tags.length > 0 && (
-                              <div className="trackDetailSection">
-                                <strong>Tags</strong>
-                                <p>{track.tags.join(" · ")}</p>
-                              </div>
-                            )}
-                            {analysis ? (
-                              <>
-                                <div className="trackDetailSection">
-                                  <strong>Audio Features</strong>
-                                  <div className="analysisMetrics">
-                                    <span>{formatBpm(analysis.bpm)}</span>
-                                    <span>Energy {formatPercent(analysis.energy)}</span>
-                                    <span>Dance {formatPercent(analysis.danceability)}</span>
-                                    <span>Valence {formatPercent(analysis.valence)}</span>
-                                    <span>Acoustic {formatPercent(analysis.acousticness)}</span>
-                                    <span>Instrumental {formatPercent(analysis.instrumentalness)}</span>
-                                  </div>
-                                </div>
-                                {analysis.key && (
-                                  <div className="trackDetailSection">
-                                    <strong>Key</strong>
-                                    <p>{analysis.key}{analysis.camelotKey ? ` (${analysis.camelotKey})` : ""}{analysis.keyConfidence ? ` · confidence ${formatPercent(analysis.keyConfidence)}` : ""}</p>
-                                  </div>
-                                )}
-                                {analysis.moodTags?.length > 0 && (
-                                  <div className="trackDetailSection">
-                                    <strong>Mood Tags</strong>
-                                    <p>{analysis.moodTags.join(" · ")}</p>
-                                  </div>
-                                )}
-                              </>
-                            ) : (
-                              <div className="trackDetailSection">
-                                <strong>Audio Features</strong>
-                                <p className="analysisFallback">Not available for this track yet.</p>
-                              </div>
-                            )}
-                            {track.year && (
-                              <div className="trackDetailSection">
-                                <strong>Year</strong>
-                                <p>{track.year}</p>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </li>
-                    );
-                  })}
+                  {displayTracks.map((track) => (
+                    <TrackRow
+                      key={track.id}
+                      track={track}
+                      expanded={expandedTrackId === track.id}
+                      onToggle={() => setExpandedTrackId(expandedTrackId === track.id ? null : track.id)}
+                    />
+                  ))}
                 </ul>
               );
             })()}
@@ -1146,7 +1203,7 @@ function App() {
                       <option value="major">Major</option>
                       <option value="minor">Minor</option>
                     </select>
-                    <span className="filterCount">{filteredTracks.length} track{filteredTracks.length !== 1 ? "s" : ""}</span>
+                    <span className="filterCount">{filterLoading ? "Searching…" : filterTotal !== null ? `${filterTotal.toLocaleString()} track${filterTotal !== 1 ? "s" : ""}` : "…"}</span>
                   </div>
                   <div className="filterRow">
                     <input
@@ -1225,7 +1282,7 @@ function App() {
                     <div className="filterRow">
                       <button
                         className="ghost-button filterSaveBtn"
-                        disabled={filteredTracks.length === 0 || busyAction !== null}
+                        disabled={(filterTotal !== null && filterTotal === 0) || filterLoading || busyAction !== null}
                         onClick={() => setSavingFilterPlaylist(true)}
                       >
                         Save as Playlist
@@ -1235,89 +1292,42 @@ function App() {
                 </div>
                 </div>
                 <div className="filterResults">
-                  {!allTracksLoaded ? (
-                    <p className="emptyState">Loading tracks…</p>
-                  ) : filteredTracks.length === 0 ? (
+                  {filterLoading && filterTracks.length === 0 ? (
+                    <p className="emptyState">Searching tracks…</p>
+                  ) : filterTracks.length === 0 ? (
                     <p className="emptyState">No tracks match these filters.</p>
                   ) : (
-                    <ul className="trackList">
-                      {filteredTracks.map((track) => {
-                        const expanded = expandedTrackId === track.id;
-                        const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
-                        return (
-                          <li key={track.id}>
-                            <div
-                              className={`trackRow ${expanded ? "trackRowExpanded" : ""}`}
-                              onClick={() => setExpandedTrackId(expanded ? null : track.id)}
-                              role="button"
-                              tabIndex={0}
-                              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpandedTrackId(expanded ? null : track.id); } }}
+                    <>
+                      <ul className="trackList">
+                        {filterTracks.map((track) => (
+                          <TrackRow
+                            key={track.id}
+                            track={track}
+                            expanded={expandedTrackId === track.id}
+                            onToggle={() => setExpandedTrackId(expandedTrackId === track.id ? null : track.id)}
+                          />
+                        ))}
+                      </ul>
+                      <div className="filterFooter">
+                        {filterTotal !== null && filterTracks.length < filterTotal ? (
+                          filterTracks.length >= FILTER_MAX_ROWS ? (
+                            <span className="filterCount">
+                              Showing {filterTracks.length.toLocaleString()} of {filterTotal.toLocaleString()} — refine the filters to narrow further.
+                            </span>
+                          ) : (
+                            <button
+                              className="ghost-button filterSaveBtn"
+                              onClick={loadMoreFilterTracks}
+                              disabled={filterLoading || filterMoreLoading || busyAction !== null}
                             >
-                              <div className="trackHead">
-                                <div>
-                                  <strong>{track.title || "Unknown Title"}</strong>
-                                  <span>
-                                    {track.artist || "Unknown Artist"} • {track.album || "Unknown Album"}
-                                  </span>
-                                </div>
-                                <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
-                                  {analysis ? "Analyzed" : "Metadata"}
-                                </span>
-                              </div>
-                              <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
-                            </div>
-                            {expanded && (
-                              <div className="trackDetail">
-                                {track.tags.length > 0 && (
-                                  <div className="trackDetailSection">
-                                    <strong>Tags</strong>
-                                    <p>{track.tags.join(" · ")}</p>
-                                  </div>
-                                )}
-                                {analysis ? (
-                                  <>
-                                    <div className="trackDetailSection">
-                                      <strong>Audio Features</strong>
-                                      <div className="analysisMetrics">
-                                        <span>{formatBpm(analysis.bpm)}</span>
-                                        <span>Energy {formatPercent(analysis.energy)}</span>
-                                        <span>Dance {formatPercent(analysis.danceability)}</span>
-                                        <span>Valence {formatPercent(analysis.valence)}</span>
-                                        <span>Acoustic {formatPercent(analysis.acousticness)}</span>
-                                        <span>Instrumental {formatPercent(analysis.instrumentalness)}</span>
-                                      </div>
-                                    </div>
-                                    {analysis.key && (
-                                      <div className="trackDetailSection">
-                                        <strong>Key</strong>
-                                        <p>{analysis.key}{analysis.camelotKey ? ` (${analysis.camelotKey})` : ""}{analysis.keyConfidence ? ` · confidence ${formatPercent(analysis.keyConfidence)}` : ""}</p>
-                                      </div>
-                                    )}
-                                    {analysis.moodTags?.length > 0 && (
-                                      <div className="trackDetailSection">
-                                        <strong>Mood Tags</strong>
-                                        <p>{analysis.moodTags.join(" · ")}</p>
-                                      </div>
-                                    )}
-                                  </>
-                                ) : (
-                                  <div className="trackDetailSection">
-                                    <strong>Audio Features</strong>
-                                    <p className="analysisFallback">Not available for this track yet.</p>
-                                  </div>
-                                )}
-                                {track.year && (
-                                  <div className="trackDetailSection">
-                                    <strong>Year</strong>
-                                    <p>{track.year}</p>
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </li>
-                        );
-                      })}
-                    </ul>
+                              {filterMoreLoading ? "Loading…" : `Load more (${(filterTotal - filterTracks.length).toLocaleString()} remaining)`}
+                            </button>
+                          )
+                        ) : (
+                          <span className="filterCount">Showing all {filterTracks.length.toLocaleString()} matching track{filterTracks.length === 1 ? "" : "s"}</span>
+                        )}
+                      </div>
+                    </>
                   )}
                 </div>
               </>
