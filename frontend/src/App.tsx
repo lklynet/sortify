@@ -67,6 +67,7 @@ type Track = {
 };
 type FilterParams = {
   selectedTags: string[];
+  q: string;
   bpmMin: number;
   bpmMax: number;
   keyQuery: string;
@@ -132,6 +133,7 @@ function buildFilterUrl(params: FilterParams, offset: number, limit: number) {
   if (params.selectedTags.length > 0) {
     query.set("tags", params.selectedTags.join(","));
   }
+  if (params.q.trim()) query.set("q", params.q.trim());
   if (!Number.isNaN(params.bpmMin)) query.set("bpmMin", String(params.bpmMin));
   if (!Number.isNaN(params.bpmMax)) query.set("bpmMax", String(params.bpmMax));
   if (params.keyQuery.trim()) query.set("keyQuery", params.keyQuery);
@@ -337,7 +339,7 @@ function App() {
   const [searchResults, setSearchResults] = useState<Track[] | null>(null);
   const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [filterParams, setFilterParams] = useState<FilterParams>({ selectedTags: [], bpmMin: NaN, bpmMax: NaN, keyQuery: "", keyMode: "", energyMin: NaN, energyMax: NaN, yearMin: NaN, yearMax: NaN });
+  const [filterParams, setFilterParams] = useState<FilterParams>({ selectedTags: [], q: "", bpmMin: NaN, bpmMax: NaN, keyQuery: "", keyMode: "", energyMin: NaN, energyMax: NaN, yearMin: NaN, yearMax: NaN });
   const [filterTracks, setFilterTracks] = useState<Track[]>([]);
   const [filterTotal, setFilterTotal] = useState<number | null>(null);
   const [filterLoading, setFilterLoading] = useState(false);
@@ -1416,6 +1418,13 @@ function App() {
               <div className="filterPanel">
                 <div className="filterControls">
                   <div className="filterRow">
+                    <input
+                      className="filterInput filterSearchField"
+                      type="search"
+                      placeholder="Search title, artist, or album…"
+                      value={filterParams.q}
+                      onChange={(e) => setFilterParams((p) => ({ ...p, q: e.target.value }))}
+                    />
                     <div className="tagInputWrap">
                       {filterParams.selectedTags.map((tag) => (
                         <span key={tag} className="tagBadge" onClick={() => removeTag(tag)} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); removeTag(tag); } }}>
@@ -1549,7 +1558,9 @@ function App() {
                           disabled={busyAction !== null}
                           onClick={saveRadioPlaylist}
                         >
-                          {busyAction === "save-radio-playlist" ? "…" : `Create radio (${radioSeedIds.length} seeds)`}
+                          {editingRadioId !== null
+                            ? busyAction === "save-radio-seeds" ? "…" : `Update seeds (${radioSeedIds.length})`
+                            : busyAction === "save-radio-playlist" ? "…" : `Create radio (${radioSeedIds.length} seeds)`}
                         </button>
                       )}
                       <button

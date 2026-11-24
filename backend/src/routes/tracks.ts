@@ -87,6 +87,7 @@ router.get("/api/tracks/filter", (req, res) => {
     bpmMin: queryNumberParam(req.query.bpmMin),
     bpmMax: queryNumberParam(req.query.bpmMax),
     keyQuery: typeof req.query.keyQuery === "string" ? req.query.keyQuery : "",
+    q: typeof req.query.q === "string" ? req.query.q : "",
     keyMode: req.query.keyMode === "major" || req.query.keyMode === "minor" ? req.query.keyMode : "",
     energyMin: queryNumberParam(req.query.energyMin),
     energyMax: queryNumberParam(req.query.energyMax),

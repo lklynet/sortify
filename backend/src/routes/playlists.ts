@@ -256,6 +256,11 @@ router.post("/api/playlists/:id/refresh", async (req, res) => {
         if (filters.keyMode === "minor" && !isMinor) return false;
         if (filters.keyMode === "major" && !isMajor) return false;
       }
+      if (typeof filters.q === "string" && filters.q.trim()) {
+        const haystack = `${track.title ?? ""} ${track.artist ?? ""} ${track.album ?? ""}`.toLowerCase();
+        const tokens = (filters.q as string).trim().toLowerCase().split(/\s+/).filter(Boolean);
+        if (tokens.length > 0 && !tokens.some((token) => haystack.includes(token))) return false;
+      }
       return true;
     });
     const poolIds = filterPool.slice(0, appState.settings.maxTracksPerPlaylist).map((t) => t.id);

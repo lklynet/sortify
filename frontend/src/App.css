@@ -214,10 +214,23 @@ h3 {
   padding: 1.05rem 1.1rem;
 }
 
+.settings-dropdown {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.settings-dropdown .panel-header {
+  flex: none;
+}
+
 .settings-dropdown .panel-content {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .settings-groups {
@@ -1161,6 +1174,10 @@ button:disabled {
 .filterInputKeyMode {
   max-width: 110px;
   flex: 0 0 auto;
+}
+
+.filterSearchField {
+  flex: 1.4 1 190px;
 }
 
 .tagInputWrap {

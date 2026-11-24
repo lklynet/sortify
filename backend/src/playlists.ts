@@ -448,6 +448,9 @@ export async function refreshRecommendedPlaylists(
 
 export function buildFilterDescription(filters: Record<string, unknown>): string {
   const parts: string[] = [];
+  if (typeof filters.q === "string" && filters.q.trim()) {
+    parts.push(`matches “${(filters.q as string).trim()}”`);
+  }
   if (Array.isArray(filters.selectedTags) && (filters.selectedTags as string[]).length > 0) {
     parts.push((filters.selectedTags as string[]).join(", "));
   }
