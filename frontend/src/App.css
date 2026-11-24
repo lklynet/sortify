@@ -214,10 +214,23 @@ h3 {
   padding: 1.05rem 1.1rem;
 }
 
+.settings-dropdown {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.settings-dropdown .panel-header {
+  flex: none;
+}
+
 .settings-dropdown .panel-content {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .settings-groups {
@@ -294,6 +307,41 @@ h3 {
   padding-top: 1rem;
   margin-top: 1rem;
   border-top: 1px solid var(--line);
+}
+
+.settings-group-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.field-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.field-check label {
+  color: var(--text);
+}
+
+.field-check input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  flex: none;
+  accent-color: var(--accent, #7c5cff);
+}
+
+.field-check-inline {
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.settings-actions {
+  border-top: none;
+  padding-top: 0.25rem;
+  margin-top: 0.9rem;
 }
 
 button {
@@ -823,7 +871,7 @@ button:disabled {
 .playlistTopRow > div {
   flex: 1 1 auto;
   min-width: 0;
-  padding-right: 6.5rem;
+  padding-right: 9rem;
 }
 
 .playlistRefreshBtn {
@@ -836,7 +884,7 @@ button:disabled {
   font-size: 0.94rem;
   position: absolute;
   top: 0;
-  right: 4.75rem;
+  right: 6.75rem;
   color: var(--text-muted);
 }
 .playlistRefreshBtn:hover:not(:disabled) {
@@ -854,7 +902,7 @@ button:disabled {
   font-size: 0.94rem;
   position: absolute;
   top: 0;
-  right: 2.25rem;
+  right: 4.5rem;
   color: var(--text-muted);
   border-color: transparent;
   background: transparent;
@@ -863,6 +911,19 @@ button:disabled {
   color: #dbe7ff;
   border-color: rgba(41, 121, 255, 0.4);
   background: rgba(41, 121, 255, 0.12);
+}
+
+.playlistFewestBtn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.94rem;
+  position: absolute;
+  top: 0;
+  right: 2.25rem;
 }
 
 .playlistDeleteBtn {
@@ -1115,6 +1176,10 @@ button:disabled {
   flex: 0 0 auto;
 }
 
+.filterSearchField {
+  flex: 1.4 1 190px;
+}
+
 .tagInputWrap {
   flex: 1 1 0;
   min-width: 0;
@@ -1210,6 +1275,12 @@ button:disabled {
   padding: 0.4rem 0.7rem;
   font-size: 0.76rem;
   white-space: nowrap;
+}
+
+.radioSeedBtn.on {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border-color: transparent;
 }
 
 .filterResults {

@@ -396,7 +396,8 @@ function rerankTrackPoolForPlaylist(
   artistByTrackId: Map<number, string>,
   playCountByTrackId: Map<number, number>,
   favoriteByTrackId: Map<number, boolean>,
-  maxPlayCount: number
+  maxPlayCount: number,
+  fewestListensPriority = false
 ): number[] {
   const uniqueTrackIds = [...new Set(trackIds)];
   if (!uniqueTrackIds.length) {
@@ -443,7 +444,9 @@ function rerankTrackPoolForPlaylist(
         if (!selected.length) {
           redundancyPenalty = 0;
         }
-        const score = tagScore * 0.46 + audioScore * 0.24 + noveltyScore * 0.16 + sourceScore * 0.14 + favoriteBonus - redundancyPenalty * 0.18;
+        const score = fewestListensPriority
+          ? tagScore * 0.14 + audioScore * 0.1 + noveltyScore * 0.56 + sourceScore * 0.08 + favoriteBonus * 0.5 - redundancyPenalty * 0.08
+          : tagScore * 0.46 + audioScore * 0.24 + noveltyScore * 0.16 + sourceScore * 0.14 + favoriteBonus - redundancyPenalty * 0.18;
         if (score > bestScore) {
           bestScore = score;
           bestTrackId = trackId;
@@ -574,6 +577,8 @@ type GenerateCandidatesConfig = {
     id: number;
     tags_json: string;
   }>;
+  fewestListensPriority?: boolean;
+  fewestListensPrioritySlugs?: Set<string>;
 };
 
 export async function generateCandidates(
@@ -590,6 +595,9 @@ export async function generateCandidates(
   const audioVectorByTrackId = new Map<number, number[]>();
   const playCountByTrackId = new Map<number, number>();
   const favoriteByTrackId = new Map<number, boolean>();
+  const fewestListensPrioritySlugs = config.fewestListensPrioritySlugs ?? new Set<string>();
+  const fewestListensPriorityFor = (slug: string): boolean =>
+    Boolean(config.fewestListensPriority) || fewestListensPrioritySlugs.has(slug);
   // NOTE: compute with a loop, not Math.max(...enriched.map(...)). Spreading the
   // full track list into a call's argument list throws "RangeError: Maximum
   // call stack size exceeded" once the library exceeds the engine's argument
@@ -684,7 +692,8 @@ export async function generateCandidates(
         artistByTrackId,
         playCountByTrackId,
         favoriteByTrackId,
-        maxPlayCount
+        maxPlayCount,
+        fewestListensPriorityFor(`cluster-${slugify(primaryTag)}`)
       );
     if (pooled.length < 16) {
       continue;
@@ -743,7 +752,8 @@ export async function generateCandidates(
       artistByTrackId,
       playCountByTrackId,
       favoriteByTrackId,
-      maxPlayCount
+      maxPlayCount,
+      fewestListensPriorityFor(`mood-${slugify(mood.name)}`)
     );
     const signatureTags = topTagsFromTrackIds(pooled, primaryTagsByTrackId, 5);
     const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
@@ -784,7 +794,7 @@ export async function generateCandidates(
       .sort((a, b) => b.score - a.score)
       .slice(0, playlistPoolTargetSize * 2)
       .map((item) => item.id);
-    const pooled = rerankTrackPoolForPlaylist(ranked, 48, centroid, contextAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
+    const pooled = rerankTrackPoolForPlaylist(ranked, 48, centroid, contextAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount, fewestListensPriorityFor(contextual.slug));
     const signatureTags = topTagsFromTrackIds(pooled, primaryTagsByTrackId, 5);
     const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
     const { name, description } = buildPlaylistName({ source: "mood", signatureTags, moodName: contextual.name });
@@ -816,7 +826,7 @@ export async function generateCandidates(
       .sort((a, b) => b.score - a.score)
       .slice(0, bpmList.targetSize * 2)
       .map((item) => item.id);
-    const pooled = rerankTrackPoolForPlaylist(ranked, bpmList.targetSize, centroid, bpmAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
+    const pooled = rerankTrackPoolForPlaylist(ranked, bpmList.targetSize, centroid, bpmAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount, fewestListensPriorityFor(bpmList.slug));
     if (pooled.length < 8) continue;
     const signatureTags = topTagsFromTrackIds(pooled, primaryTagsByTrackId, 4);
     const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
@@ -847,7 +857,7 @@ export async function generateCandidates(
         .sort((a, b) => b.score - a.score)
         .slice(0, playlistPoolTargetSize * 2)
         .map((item) => item.id);
-      const pooled = rerankTrackPoolForPlaylist(ranked, 42, centroid, decadeAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount);
+      const pooled = rerankTrackPoolForPlaylist(ranked, 42, centroid, decadeAudioVector, trackTagsByTrackId, audioVectorByTrackId, artistByTrackId, playCountByTrackId, favoriteByTrackId, maxPlayCount, fewestListensPriorityFor(`decade-${decade}-${slugify(genre)}`));
       if (pooled.length < 10) continue;
       const pooledAudioVector = averageAudioVector(pooled, audioVectorByTrackId);
       const { name, description } = buildPlaylistName({ source: "cluster", signatureTags: centroid });
@@ -896,7 +906,8 @@ export async function generateCandidates(
       artistByTrackId,
       playCountByTrackId,
       favoriteByTrackId,
-      maxPlayCount
+      maxPlayCount,
+      fewestListensPriorityFor(`artist-${slugify(seedArtist)}`)
     );
     const audioVector = averageAudioVector(pooled, audioVectorByTrackId);
     const { name, description } = buildPlaylistName({
@@ -958,7 +969,8 @@ export async function generateCandidates(
       artistByTrackId,
       playCountByTrackId,
       favoriteByTrackId,
-      maxPlayCount
+      maxPlayCount,
+      fewestListensPriorityFor("discovery-mix")
     );
     const audioVector = averageAudioVector(pooled, audioVectorByTrackId);
     const discoveryTags = favoriteTags.slice(0, 8);

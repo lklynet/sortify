@@ -29,6 +29,23 @@ export function buildTrackFilterWhere(filters: Record<string, unknown>): { where
   const clauses: string[] = [];
   const params: unknown[] = [];
 
+  const searchQuery = typeof filters.q === "string" ? filters.q.trim() : "";
+  if (searchQuery) {
+    const tokens = searchQuery.split(/\s+/).filter(Boolean);
+    if (tokens.length > 0) {
+      // A track matches when any search token appears in its title, artist, or album.
+      clauses.push(
+        `(${tokens
+          .map(() => "lower(title) LIKE ? ESCAPE '\\' OR lower(artist) LIKE ? ESCAPE '\\' OR lower(album) LIKE ? ESCAPE '\\'")
+          .join(" OR ")})`
+      );
+      for (const token of tokens) {
+        const escaped = `%${escapeLike(token.toLowerCase())}%`;
+        params.push(escaped, escaped, escaped);
+      }
+    }
+  }
+
   // Note: needles are intentionally NOT trimmed — the legacy client-side
   // predicate matched `tag.includes(needle)` verbatim (the UI trims input
   // separately), and substring semantics must stay identical.

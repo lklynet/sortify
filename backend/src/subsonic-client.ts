@@ -20,6 +20,8 @@ export type SubsonicSong = {
   year?: number;
   duration?: number;
   genre?: string;
+  playCount?: number;
+  starred?: boolean;
 };
 
 function buildSubsonicQuery(connection: SubsonicConnection, params: SubsonicQueryParams = {}, includeFormat = true) {
@@ -60,10 +62,10 @@ export function getSubsonicConnection(input: unknown, defaults: { baseUrl: strin
   return { baseUrl, username, password };
 }
 
-export async function subsonicRequest<T>(connection: SubsonicConnection, endpoint: string, params: SubsonicQueryParams = {}): Promise<T> {
+export async function subsonicRequest<T>(connection: SubsonicConnection, endpoint: string, params: SubsonicQueryParams = {}, timeoutMs = 12000): Promise<T> {
   const query = buildSubsonicQuery(connection, params);
   const response = await fetch(`${connection.baseUrl}/rest/${endpoint}?${query.toString()}`, {
-    signal: AbortSignal.timeout(12000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!response.ok) {
     log.warn("subsonic request failed", { endpoint, status: response.status });
@@ -126,17 +128,19 @@ export async function uploadNavidromePlaylistArtwork(
   }
 }
 
-export async function fetchSubsonicSongs(connection: SubsonicConnection): Promise<SubsonicSong[]> {
+export async function fetchSubsonicSongs(connection: SubsonicConnection, limit?: number): Promise<SubsonicSong[]> {
   const songs: SubsonicSong[] = [];
   const pageSize = 500;
-  log.debug("fetching songs from subsonic", { baseUrl: connection.baseUrl });
+  log.debug("fetching songs from subsonic", { baseUrl: connection.baseUrl, limit: limit ?? null });
   let offset = 0;
   while (true) {
+    // Cold-start getAlbumList2 can exceed the default 12s while Navidrome builds
+    // the alphabetical index on a large library; give the discovery listing a longer window.
     const list = await subsonicRequest<{ albumList2?: { album?: Array<{ id: string }> } }>(connection, "getAlbumList2.view", {
       type: "alphabeticalByName",
       size: String(pageSize),
       offset: String(offset)
-    });
+    }, 60000);
     const albums = list.albumList2?.album ?? [];
     if (!albums.length) {
       break;
@@ -144,12 +148,21 @@ export async function fetchSubsonicSongs(connection: SubsonicConnection): Promis
     for (const album of albums) {
       const detail = await subsonicRequest<{ album?: { song?: SubsonicSong[] } }>(connection, "getAlbum.view", { id: album.id });
       songs.push(...(detail.album?.song ?? []));
+      if (limit !== undefined && songs.length >= limit) {
+        break;
+      }
+    }
+    // A limited (debug) scan stops discovery as soon as enough songs are collected so it
+    // never fetches full metadata for a huge library.
+    if (limit !== undefined && songs.length >= limit) {
+      break;
     }
     if (albums.length < pageSize) {
       break;
     }
     offset += pageSize;
   }
-  log.debug("fetched songs from subsonic", { count: songs.length });
-  return songs;
+  const result = limit !== undefined ? songs.slice(0, limit) : songs;
+  log.debug("fetched songs from subsonic", { count: result.length, limit: limit ?? null });
+  return result;
 }
