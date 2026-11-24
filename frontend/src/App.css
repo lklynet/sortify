@@ -296,6 +296,41 @@ h3 {
   border-top: 1px solid var(--line);
 }
 
+.settings-group-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.field-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.field-check label {
+  color: var(--text);
+}
+
+.field-check input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  flex: none;
+  accent-color: var(--accent, #7c5cff);
+}
+
+.field-check-inline {
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.settings-actions {
+  border-top: none;
+  padding-top: 0.25rem;
+  margin-top: 0.9rem;
+}
+
 button {
   border: none;
   border-radius: 12px;
@@ -1210,6 +1245,12 @@ button:disabled {
   padding: 0.4rem 0.7rem;
   font-size: 0.76rem;
   white-space: nowrap;
+}
+
+.radioSeedBtn.on {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border-color: transparent;
 }
 
 .filterResults {

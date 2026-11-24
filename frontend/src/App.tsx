@@ -33,7 +33,11 @@ type Playlist = {
   name: string;
   description: string;
   mode: "dynamic" | "pinned";
+  fewestListensPriority?: boolean;
   updated_at: string;
+  kind?: "standard" | "filter" | "radio";
+  seedCount?: number;
+  seeds?: Array<{ id: number; title: string; artist: string }>;
   artworkUrl: string | null;
   artworkAttribution: string | null;
   artworkAttributionUrl: string | null;
@@ -96,6 +100,16 @@ type Settings = {
   weeklyPlaylistCount: number;
   maxTracksPerPlaylist: number;
   cycleSchedule: string;
+  smtpEnabled: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string;
+  smtpPassword: string;
+  hasSmtpPassword: boolean;
+  smtpFrom: string;
+  smtpTo: string;
+  smtpTlsInsecure: boolean;
 };
 type ConfirmRefreshModal =
   | {
@@ -165,7 +179,17 @@ function hasAudioAnalysis(track: Track) {
   return Boolean(track.audioFeatures && Array.isArray(track.audioFeatures.moodTags));
 }
 
-function TrackRow({ track, expanded, onToggle }: { track: Track; expanded: boolean; onToggle: () => void }) {
+function TrackRow({
+  track,
+  expanded,
+  onToggle,
+  seed
+}: {
+  track: Track;
+  expanded: boolean;
+  onToggle: () => void;
+  seed?: { isSeed: boolean; onToggleSeed: (id: number) => void };
+}) {
   const analysis = hasAudioAnalysis(track) ? track.audioFeatures : null;
   return (
     <li>
@@ -186,6 +210,17 @@ function TrackRow({ track, expanded, onToggle }: { track: Track; expanded: boole
           <span className={`trackAnalysisPill ${analysis ? "on" : "off"}`}>
             {analysis ? "Analyzed" : "Metadata"}
           </span>
+          {seed && (
+            <button
+              type="button"
+              className={`ghost-button filterSaveBtn radioSeedBtn ${seed.isSeed ? "on" : ""}`}
+              onClick={(e) => { e.stopPropagation(); seed.onToggleSeed(track.id); }}
+              title={seed.isSeed ? "Remove from radio seeds" : "Add as radio seed"}
+              aria-pressed={seed.isSeed}
+            >
+              📻 {seed.isSeed ? "Seed" : "Seed?"}
+            </button>
+          )}
         </div>
         <p>{track.tags.slice(0, 6).join(" · ") || "untagged"}</p>
       </div>
@@ -252,7 +287,17 @@ function App() {
     hasLastFmApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20,
-    cycleSchedule: "weekly"
+    cycleSchedule: "weekly",
+    smtpEnabled: false,
+    smtpHost: "",
+    smtpPort: 587,
+    smtpSecure: false,
+    smtpUser: "",
+    smtpPassword: "",
+    hasSmtpPassword: false,
+    smtpFrom: "",
+    smtpTo: "",
+    smtpTlsInsecure: false
   });
   const [settingsDraft, setSettingsDraft] = useState<Settings>({
     navidromeUrl: "",
@@ -263,7 +308,17 @@ function App() {
     hasLastFmApiKey: false,
     weeklyPlaylistCount: 3,
     maxTracksPerPlaylist: 20,
-    cycleSchedule: "weekly"
+    cycleSchedule: "weekly",
+    smtpEnabled: false,
+    smtpHost: "",
+    smtpPort: 587,
+    smtpSecure: false,
+    smtpUser: "",
+    smtpPassword: "",
+    hasSmtpPassword: false,
+    smtpFrom: "",
+    smtpTo: "",
+    smtpTlsInsecure: false
   });
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [stats, setStats] = useState<Stats>({ tracks: 0, playlists: 0, analyzedTracks: 0 });
@@ -294,6 +349,8 @@ function App() {
   const [tagInputFocused, setTagInputFocused] = useState(false);
   const [savingFilterPlaylist, setSavingFilterPlaylist] = useState(false);
   const [filterPlaylistName, setFilterPlaylistName] = useState("");
+  const [radioSeedIds, setRadioSeedIds] = useState<number[]>([]);
+  const [editingRadioId, setEditingRadioId] = useState<number | null>(null);
 
   useEffect(() => {
     if (!searchQuery.trim()) {
@@ -402,6 +459,8 @@ function App() {
     (nextSettings: Settings, currentDraft: Settings) => ({
       ...nextSettings,
       navidromePassword: currentDraft.navidromePassword,
+      smtpPassword: currentDraft.smtpPassword,
+      hasSmtpPassword: nextSettings.hasSmtpPassword || currentDraft.smtpPassword.trim().length > 0,
       lastFmApiKey: currentDraft.lastFmApiKey,
       hasNavidromePassword: nextSettings.hasNavidromePassword || currentDraft.navidromePassword.trim().length > 0,
       hasLastFmApiKey: nextSettings.hasLastFmApiKey || currentDraft.lastFmApiKey.trim().length > 0
@@ -409,12 +468,20 @@ function App() {
     []
   );
   const settingsPayload = useMemo(() => {
-    const nextSettings: Record<string, string | number> = {
+    const nextSettings: Record<string, string | number | boolean> = {
       navidromeUrl: settingsDraft.navidromeUrl.trim(),
       navidromeUsername: settingsDraft.navidromeUsername.trim(),
       weeklyPlaylistCount: settingsDraft.weeklyPlaylistCount,
       maxTracksPerPlaylist: settingsDraft.maxTracksPerPlaylist,
-      cycleSchedule: settingsDraft.cycleSchedule
+      cycleSchedule: settingsDraft.cycleSchedule,
+      smtpEnabled: settingsDraft.smtpEnabled,
+      smtpHost: settingsDraft.smtpHost.trim(),
+      smtpPort: settingsDraft.smtpPort,
+      smtpSecure: settingsDraft.smtpSecure,
+      smtpUser: settingsDraft.smtpUser.trim(),
+      smtpFrom: settingsDraft.smtpFrom.trim(),
+      smtpTo: settingsDraft.smtpTo.trim(),
+      smtpTlsInsecure: settingsDraft.smtpTlsInsecure
     };
     if (settingsDraft.navidromePassword.trim()) {
       nextSettings.navidromePassword = settingsDraft.navidromePassword.trim();
@@ -559,6 +626,23 @@ function App() {
       await persistSettings();
     });
 
+  const sendTestEmail = () =>
+    runAction("smtp-test", async () => {
+      await callApi<{ ok: boolean }>("/api/settings/smtp/test", {
+        method: "POST",
+        body: JSON.stringify({
+          smtpHost: settingsDraft.smtpHost,
+          smtpPort: settingsDraft.smtpPort,
+          smtpSecure: settingsDraft.smtpSecure,
+          smtpUser: settingsDraft.smtpUser,
+          smtpPassword: settingsDraft.smtpPassword,
+          smtpFrom: settingsDraft.smtpFrom,
+          smtpTo: settingsDraft.smtpTo,
+          smtpTlsInsecure: settingsDraft.smtpTlsInsecure
+        })
+      });
+    });
+
   const refreshAnalyzedTracks = () =>
     runAction("refresh-analysis", async () => {
       await persistSettings();
@@ -590,6 +674,16 @@ function App() {
         method: "PATCH",
         body: JSON.stringify({ mode })
       });
+    });
+
+  const toggleFewestListens = (playlistId: number, enabled: boolean) =>
+    runAction(`playlist-fewest-${playlistId}-${enabled ? "on" : "off"}`, async () => {
+      await callApi(`/api/playlists/${playlistId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ fewestListensPriority: enabled })
+      });
+      const fetched = await callApi<Playlist[]>("/api/playlists");
+      if (fetched) setPlaylists(fetched);
     });
 
   const deletePlaylist = (playlistId: number) =>
@@ -630,6 +724,35 @@ function App() {
       const fetched = await callApi<Playlist[]>("/api/playlists");
       if (fetched) setPlaylists(fetched);
     });
+
+  const saveRadioPlaylist = () =>
+    runAction(editingRadioId !== null ? "save-radio-seeds" : "save-radio-playlist", async () => {
+      const payload: Record<string, unknown> = { seedTrackIds: radioSeedIds };
+      if (editingRadioId === null) {
+        payload.name = filterPlaylistName.trim() || "Radio";
+        if (hasSubsonicConnection) payload.connection = connectionPayload;
+        await callApi("/api/playlists/radio", { method: "POST", body: JSON.stringify(payload) });
+      } else {
+        await callApi(`/api/playlists/${editingRadioId}/seeds`, { method: "PUT", body: JSON.stringify(payload) });
+      }
+      setFilterPlaylistName("");
+      setRadioSeedIds([]);
+      setEditingRadioId(null);
+      const fetched = await callApi<Playlist[]>("/api/playlists");
+      if (fetched) setPlaylists(fetched);
+    });
+
+  const startEditingRadioSeeds = async (playlist: Playlist) => {
+    try {
+      const fetched = await callApi<Playlist[]>("/api/playlists");
+      const full = fetched?.find((p) => p.id === playlist.id);
+      setRadioSeedIds(full?.seeds?.map((seed) => seed.id) ?? []);
+      setEditingRadioId(playlist.id);
+      setPlaylistTab("filter");
+    } catch {
+      setError("Could not load the seed tracks for this radio playlist.");
+    }
+  };
 
   const openRefreshConfirmation = (action: "analysis" | "playlists") => {
     setConfirmRefreshModal(
@@ -761,6 +884,134 @@ function App() {
                       placeholder={settingsDraft.hasLastFmApiKey ? "****************" : "enter Last.fm key"}
                     />
                   </div>
+                </div>
+              </section>
+
+              <section className="settings-group">
+                <div className="settings-group-header settings-group-header-row">
+                  <h4>Email (SMTP)</h4>
+                  <label className="field-check field-check-inline">
+                    <input
+                      type="checkbox"
+                      checked={settingsDraft.smtpEnabled}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpEnabled: event.target.checked }));
+                        setSettingsDirty(true);
+                      }}
+                    />
+                    <span>Send weekly refresh digest</span>
+                  </label>
+                </div>
+                <div className="controls-grid settings-compact-grid">
+                  <div className="field">
+                    <label htmlFor="smtpHost">SMTP host</label>
+                    <input
+                      id="smtpHost"
+                      type="text"
+                      value={settingsDraft.smtpHost}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpHost: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                      placeholder="smtp.example.com"
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="smtpPort">Port</label>
+                    <input
+                      id="smtpPort"
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={settingsDraft.smtpPort}
+                      onChange={(event) => {
+                        const value = Number(event.target.value);
+                        setSettingsDraft((prev) => ({ ...prev, smtpPort: Number.isFinite(value) ? Math.max(1, Math.min(65535, Math.round(value))) : 587 }));
+                        setSettingsDirty(true);
+                      }}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="smtpUser">Username</label>
+                    <input
+                      id="smtpUser"
+                      type="text"
+                      value={settingsDraft.smtpUser}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpUser: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                      placeholder="you@example.com"
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="smtpPassword">Password / app password</label>
+                    <input
+                      id="smtpPassword"
+                      type="password"
+                      value={settingsDraft.smtpPassword}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpPassword: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                      placeholder={settingsDraft.hasSmtpPassword ? "****************" : "leave blank to keep saved"}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="smtpFrom">From address</label>
+                    <input
+                      id="smtpFrom"
+                      type="text"
+                      value={settingsDraft.smtpFrom}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpFrom: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                      placeholder="Sortify <no-reply@example.com>"
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="smtpTo">Send digest to</label>
+                    <input
+                      id="smtpTo"
+                      type="text"
+                      value={settingsDraft.smtpTo}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpTo: event.target.value }));
+                        setSettingsDirty(true);
+                      }}
+                      placeholder="you@example.com"
+                    />
+                  </div>
+                  <div className="field field-check">
+                    <label htmlFor="smtpSecure">Implicit TLS (port 465)</label>
+                    <input
+                      id="smtpSecure"
+                      type="checkbox"
+                      checked={settingsDraft.smtpSecure}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpSecure: event.target.checked }));
+                        setSettingsDirty(true);
+                      }}
+                    />
+                  </div>
+                  <div className="field field-check">
+                    <label htmlFor="smtpTlsInsecure">Allow self-signed TLS</label>
+                    <input
+                      id="smtpTlsInsecure"
+                      type="checkbox"
+                      checked={settingsDraft.smtpTlsInsecure}
+                      onChange={(event) => {
+                        setSettingsDraft((prev) => ({ ...prev, smtpTlsInsecure: event.target.checked }));
+                        setSettingsDirty(true);
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="actions settings-actions">
+                  <button onClick={sendTestEmail} disabled={busyAction !== null}>
+                    {busyAction === "smtp-test" ? "Sending…" : "Send Test Email"}
+                  </button>
                 </div>
               </section>
 
@@ -1005,6 +1256,17 @@ function App() {
                               </button>
                               <button
                                 type="button"
+                                className="ghost-button playlistFewestBtn"
+                                style={playlist.fewestListensPriority ? { backgroundColor: "rgba(0,190,110,0.22)", borderColor: "rgba(0,190,110,0.5)" } : { opacity: 0.6 }}
+                                onClick={() => toggleFewestListens(playlist.id, !playlist.fewestListensPriority)}
+                                disabled={busyAction !== null}
+                                aria-label={`${playlist.fewestListensPriority ? "Disable" : "Enable"} fewest-listens priority for ${playlist.name}`}
+                                title={playlist.fewestListensPriority ? "Fewest-listens priority ON — refresh favors rarely played tracks. Click to turn off." : "Fewest-listens priority OFF. Click to make refreshes favor tracks you play the least."}
+                              >
+                                {busyAction === `playlist-fewest-${playlist.id}-${playlist.fewestListensPriority ? "off" : "on"}` ? "…" : "🎯"}
+                              </button>
+                              <button
+                                type="button"
                                 className="ghost-button playlistDeleteBtn"
                                 onClick={() => deletePlaylist(playlist.id)}
                                 disabled={busyAction !== null}
@@ -1017,6 +1279,16 @@ function App() {
                           );
                         })()}
                       </div>
+                      {playlist.kind === "radio" && (
+                        <button
+                          className="ghost-button filterSaveBtn"
+                          onClick={() => startEditingRadioSeeds(playlist)}
+                          disabled={busyAction !== null}
+                          title="Edit the seed tracks for this radio playlist"
+                        >
+                          📻 {playlist.seedCount ?? 0} seeds — edit
+                        </button>
+                      )}
                       <p>{playlist.description}</p>
                       {playlist.artworkAttribution && playlist.artworkAttributionUrl ? (
                         <a className="playlistAttribution" href={playlist.artworkAttributionUrl} target="_blank" rel="noreferrer">
@@ -1271,6 +1543,15 @@ function App() {
                       >
                         {busyAction === "save-filter-playlist" ? "…" : "Save"}
                       </button>
+                      {radioSeedIds.length > 0 && (
+                        <button
+                          className="ghost-button filterSaveBtn"
+                          disabled={busyAction !== null}
+                          onClick={saveRadioPlaylist}
+                        >
+                          {busyAction === "save-radio-playlist" ? "…" : `Create radio (${radioSeedIds.length} seeds)`}
+                        </button>
+                      )}
                       <button
                         className="ghost-button filterSaveBtn"
                         onClick={() => { setSavingFilterPlaylist(false); setFilterPlaylistName(""); }}
@@ -1287,6 +1568,33 @@ function App() {
                       >
                         Save as Playlist
                       </button>
+                      {editingRadioId !== null ? (
+                        <>
+                          <span className="filterCount">Editing radio seeds…</span>
+                          <button
+                            className="ghost-button filterSaveBtn"
+                            disabled={radioSeedIds.length === 0 || busyAction !== null}
+                            onClick={saveRadioPlaylist}
+                          >
+                            {busyAction === "save-radio-seeds" ? "…" : `Update seeds (${radioSeedIds.length})`}
+                          </button>
+                          <button
+                            className="ghost-button filterSaveBtn"
+                            onClick={() => { setEditingRadioId(null); setRadioSeedIds([]); }}
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="ghost-button filterSaveBtn"
+                          disabled={radioSeedIds.length === 0 || filterLoading || busyAction !== null}
+                          onClick={() => setSavingFilterPlaylist(true)}
+                          title="Select a few tracks you like with the 📻 buttons, then name and create the radio playlist"
+                        >
+                          Create radio ({radioSeedIds.length} seeds)
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1305,6 +1613,17 @@ function App() {
                             track={track}
                             expanded={expandedTrackId === track.id}
                             onToggle={() => setExpandedTrackId(expandedTrackId === track.id ? null : track.id)}
+                            seed={{
+                              isSeed: radioSeedIds.includes(track.id),
+                              onToggleSeed: (id) =>
+                                setRadioSeedIds((prev) =>
+                                  prev.includes(id)
+                                    ? prev.filter((x) => x !== id)
+                                    : prev.length >= 12
+                                      ? prev
+                                      : [...prev, id]
+                                )
+                            }}
                           />
                         ))}
                       </ul>
