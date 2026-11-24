@@ -56,6 +56,7 @@ router.get("/api/playlists", (_req, res) => {
       ...playlist,
       kind: seedIds.length > 0 ? "radio" : playlist.filter_json ? "filter" : "standard",
       seedCount: seedIds.length,
+      fewestListensPriority: playlist.fewest_listens_priority === 1,
       seeds,
       artworkUrl: playlist.artwork_path || null,
       artworkAttribution: playlist.artwork_attribution || null,

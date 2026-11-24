@@ -858,7 +858,7 @@ button:disabled {
 .playlistTopRow > div {
   flex: 1 1 auto;
   min-width: 0;
-  padding-right: 6.5rem;
+  padding-right: 9rem;
 }
 
 .playlistRefreshBtn {
@@ -871,7 +871,7 @@ button:disabled {
   font-size: 0.94rem;
   position: absolute;
   top: 0;
-  right: 4.75rem;
+  right: 6.75rem;
   color: var(--text-muted);
 }
 .playlistRefreshBtn:hover:not(:disabled) {
@@ -889,7 +889,7 @@ button:disabled {
   font-size: 0.94rem;
   position: absolute;
   top: 0;
-  right: 2.25rem;
+  right: 4.5rem;
   color: var(--text-muted);
   border-color: transparent;
   background: transparent;
@@ -898,6 +898,19 @@ button:disabled {
   color: #dbe7ff;
   border-color: rgba(41, 121, 255, 0.4);
   background: rgba(41, 121, 255, 0.12);
+}
+
+.playlistFewestBtn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.94rem;
+  position: absolute;
+  top: 0;
+  right: 2.25rem;
 }
 
 .playlistDeleteBtn {
